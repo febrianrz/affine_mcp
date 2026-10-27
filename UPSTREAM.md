@@ -5,3 +5,9 @@ Imported from https://github.com/DAWNCR0W/affine-mcp-server (MIT) at commit
 
 Audit at import: no install/postinstall scripts, no child_process/eval, no telemetry;
 outbound requests go only to the configured AFFiNE endpoint.
+
+## Credits
+
+Original work by DAWNCR0W and the affine-mcp-server contributors (MIT). Additions in this
+repository: multi-tenant mode (`src/tenant.ts`), the OpenAPI generator
+(`scripts/generate-openapi.mjs`), the Scalar page (`docs/index.html`), and `deploy/multi-account/`.

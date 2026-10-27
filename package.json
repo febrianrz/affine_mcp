@@ -88,6 +88,8 @@
     "test:http-security": "tsx tests/test-http-security.mjs",
     "test:http-runtime": "tsx tests/test-http-runtime-safety.mjs",
     "test:tenant": "tsx tests/test-tenant.mjs",
+    "test:openapi": "node tests/test-openapi.mjs",
+    "docs:openapi": "node scripts/generate-openapi.mjs",
     "test:oauth-http": "node tests/test-oauth-http.mjs",
     "test:organize": "node tests/test-organize-tools.mjs",
     "test:create-doc-folder-placement": "node tests/test-create-doc-folder-placement.mjs",
@@ -119,7 +121,8 @@
     "SECURITY.md",
     "glama.json",
     "tool-manifest.json",
-    "LICENSE"
+    "LICENSE",
+    "UPSTREAM.md"
   ],
   "engines": {
     "node": ">=20.18.1"

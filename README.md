@@ -1,21 +1,24 @@
-# AFFiNE MCP Server
+# AFFiNE MCP Server (multi-tenant)
 
-A Model Context Protocol (MCP) server for AFFiNE. It exposes AFFiNE workspaces and documents to AI assistants over stdio (default) or HTTP (`/mcp`) and supports both AFFiNE Cloud and self-hosted deployments.
+A Model Context Protocol (MCP) server for AFFiNE with full read/write access: create, edit, organize, and delete documents, workspaces, comments, and more. It runs over stdio or HTTP (`/mcp`) and supports self-hosted AFFiNE and AFFiNE Cloud.
 
-[![Version](https://img.shields.io/badge/version-3.10.2-blue)](https://github.com/dawncr0w/affine-mcp-server/releases)
+This repository is a fork of [**affine-mcp-server** by DAWNCR0W](https://github.com/DAWNCR0W/affine-mcp-server) (MIT). Nearly all of the tool surface and the AFFiNE protocol work is theirs; see [Credits](#credits). What this fork adds:
+
+- **Multi-tenant mode** — one deployment serves many AFFiNE users on many AFFiNE domains. Your application sends each user's AFFiNE URL and credentials per session; nothing is stored. See [Multi-tenant mode](#multi-tenant-mode).
+- **Interactive API reference** — an OpenAPI 3.1 spec generated from the running server and a [Scalar](https://scalar.com) page. See [API reference](#api-reference).
+- Deployment notes for Dokploy and multi-account setups (`deploy/multi-account/`).
+
+[![Version](https://img.shields.io/badge/version-3.10.2-blue)](package.json)
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.32.1-green)](https://github.com/modelcontextprotocol/typescript-sdk)
-[![CI](https://github.com/dawncr0w/affine-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/dawncr0w/affine-mcp-server/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
-
-<a href="https://glama.ai/mcp/servers/@DAWNCR0W/affine-mcp-server">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@DAWNCR0W/affine-mcp-server/badge" alt="AFFiNE Server MCP server" />
-</a>
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Choose Your Path](#choose-your-path)
 - [Quick Start](#quick-start)
+- [Multi-tenant mode](#multi-tenant-mode)
+- [API reference](#api-reference)
 - [Compatibility Matrix](#compatibility-matrix)
 - [Tool Surface](#tool-surface)
 - [Documentation Map](#documentation-map)
@@ -24,6 +27,7 @@ A Model Context Protocol (MCP) server for AFFiNE. It exposes AFFiNE workspaces a
 - [Development](#development)
 - [Release Notes](#release-notes)
 - [License](#license)
+- [Credits](#credits)
 - [Support](#support)
 
 ## Overview
@@ -36,6 +40,7 @@ AFFiNE MCP Server is designed for three common scenarios:
 Highlights:
 
 - Supports AFFiNE Cloud and self-hosted AFFiNE instances
+- Multi-tenant HTTP mode: per-session AFFiNE domain and credentials, with a mandatory host allowlist
 - Supports stdio and HTTP transports
 - Coordinates concurrent writes per workspace through one shared MCP server; optional document revisions reject stale edits
 - Supports session-cookie and email/password authentication, plus compatible bearer tokens for older deployments
@@ -84,6 +89,9 @@ npx -y -p affine-mcp-server affine-mcp -- --version
 ```
 
 ### 2. Or run the server in Docker
+
+> The published `ghcr.io/dawncr0w/affine-mcp-server` image is the upstream project and does not include
+> multi-tenant mode. To use this fork, build the image from this repository (`docker build -t affine-mcp .`).
 
 ```bash
 docker run -d \
@@ -229,6 +237,60 @@ If an HTTP server already runs on the same host as your stdio client, use the
 private [stdio HTTP bridge](docs/configuration-and-deployment.md#private-stdio-bridge-for-a-local-http-listener)
 instead of starting another full server process.
 
+## Multi-tenant mode
+
+Use this when your own application manages many AFFiNE users or domains. Instead of one
+fixed AFFiNE account per process, each MCP session carries its own destination and
+credentials in the headers of the `initialize` request:
+
+```bash
+docker build -t affine-mcp .
+docker run -d -p 3000:3000 \
+  -e AFFINE_MCP_MULTI_TENANT=true \
+  -e AFFINE_MCP_TENANT_ALLOWED_HOSTS="affine.example.com,*.team.example.com" \
+  -e AFFINE_MCP_HTTP_TOKEN="$(openssl rand -hex 32)" \
+  affine-mcp
+```
+
+```http
+POST /mcp
+Authorization: Bearer <AFFINE_MCP_HTTP_TOKEN>
+X-Affine-Url: https://affine.example.com
+X-Affine-Email: user@example.com
+X-Affine-Password: ********
+```
+
+- `AFFINE_MCP_HTTP_TOKEN` identifies your application to the gateway. Keep it server-side.
+- A session may only target hosts in `AFFINE_MCP_TENANT_ALLOWED_HOSTS`; the server will not start without it.
+- Credentials live in memory for the session and are never logged or written to disk.
+- Alternatives to email/password: `X-Affine-Cookie` or `X-Affine-Token`. Send exactly one method.
+
+Full header reference, status codes, and operational notes:
+[docs/configuration-and-deployment.md#multi-tenant-mode](docs/configuration-and-deployment.md#multi-tenant-mode).
+For a single fixed account per deployment, see
+[deploy/multi-account/README.md](deploy/multi-account/README.md).
+
+## API reference
+
+[docs/openapi.json](docs/openapi.json) is an OpenAPI 3.1 description of the gateway (session
+lifecycle, tenant headers, status codes) and of all 106 tools exposed in multi-tenant mode, with
+their input and output schemas. It is machine-readable, so it also works as context for your own AI.
+
+[docs/index.html](docs/index.html) renders it with Scalar. Serve the `docs` folder over HTTP:
+
+```bash
+npx serve docs
+```
+
+The spec is generated from the running server, so it cannot drift from the code:
+
+```bash
+npm run build && npm run docs:openapi
+```
+
+Tools are MCP tools, not REST endpoints. They are listed under *Webhooks* in the reference
+because OpenAPI has no concept of JSON-RPC methods; each is invoked as `tools/call` on `POST /mcp`.
+
 ## Compatibility Matrix
 
 Node.js 20.18.1 is the minimum supported runtime. CI validates the Node.js 20, 22, 24, and 26 release lines.
@@ -370,7 +432,7 @@ them against production.
 Local clone flow:
 
 ```bash
-git clone https://github.com/dawncr0w/affine-mcp-server.git
+git clone https://github.com/febrianrz/affine_mcp.git
 cd affine-mcp-server
 npm install
 npm run build
@@ -381,18 +443,28 @@ node dist/index.js
 
 - [CHANGELOG.md](CHANGELOG.md)
 - [RELEASE_NOTES.md](RELEASE_NOTES.md)
-- [GitHub Releases](https://github.com/dawncr0w/affine-mcp-server/releases)
+- [Upstream releases (DAWNCR0W/affine-mcp-server)](https://github.com/DAWNCR0W/affine-mcp-server/releases)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE).
+MIT License - see [LICENSE](LICENSE). The original copyright notice is retained as the license requires.
+
+## Credits
+
+This project exists because of [**DAWNCR0W**](https://github.com/DAWNCR0W) and the contributors to
+[affine-mcp-server](https://github.com/DAWNCR0W/affine-mcp-server), which this repository is forked from
+(imported at v3.10.2, commit `4bd2994`; see [UPSTREAM.md](UPSTREAM.md)). The tool surface, AFFiNE GraphQL/WebSocket
+integration, document model handling, and test suite are their work. Please star and support the original project.
+
+Multi-tenant mode, the OpenAPI/Scalar reference, and the deployment notes are additions in this fork.
 
 ## Support
 
-- Open an issue on [GitHub](https://github.com/dawncr0w/affine-mcp-server/issues)
+- Fork-specific issues (multi-tenant mode, API reference): open an issue on [febrianrz/affine_mcp](https://github.com/febrianrz/affine_mcp/issues)
+- Core tool behavior also exists upstream: [DAWNCR0W/affine-mcp-server issues](https://github.com/DAWNCR0W/affine-mcp-server/issues)
 - Review AFFiNE product documentation at [docs.affine.pro](https://docs.affine.pro)
 
-## Acknowledgments
+### Acknowledgments
 
 - Built for the [AFFiNE](https://affine.pro) knowledge base platform
 - Uses the [Model Context Protocol](https://modelcontextprotocol.io) specification

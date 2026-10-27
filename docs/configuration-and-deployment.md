@@ -147,6 +147,8 @@ the transport, HTTP bind/auth/origin values, and all OAuth settings shown here.
 | `AFFINE_OAUTH_SCOPES` | No | `mcp` | Scopes advertised for OAuth-protected access |
 | `AFFINE_OAUTH_CLOCK_SKEW_SECONDS` | No | `60` | Positive integer tolerance for OAuth token timestamps |
 | `AFFINE_OAUTH_ALLOW_SERVICE_WRITES` | No | `false` | Explicitly acknowledge write-capable tools using the shared AFFiNE service identity |
+| `AFFINE_MCP_MULTI_TENANT` | No | `false` | Serve many AFFiNE users and domains from one deployment; each MCP session supplies its own AFFiNE URL and credentials. Requires HTTP transport, `AFFINE_MCP_HTTP_TOKEN`, and `AFFINE_MCP_TENANT_ALLOWED_HOSTS` |
+| `AFFINE_MCP_TENANT_ALLOWED_HOSTS` | Required in multi-tenant mode | none | Comma-separated AFFiNE hostnames a session may target: exact (`affine.example.com`) or `*.team.example.com` (subdomains only). A bare `*` is rejected |
 
 The following HTTP, proxy, and runtime controls are environment-only. They are
 read when the HTTP server, proxy, or WebSocket client starts and are not read
@@ -542,3 +544,42 @@ Before exposing the server remotely, confirm:
 - Invalid transport, port, origin, or boolean values now fail at startup instead of silently falling back
 - Remote plain-HTTP AFFiNE URL rejected: use HTTPS, or set `AFFINE_ALLOW_INSECURE_HTTP=true` only for a trusted private network
 - Non-loopback bearer listener rejected: set `AFFINE_MCP_HTTP_TOKEN` or configure OAuth
+
+## Multi-tenant mode
+
+Set `AFFINE_MCP_MULTI_TENANT=true` to let your application serve many AFFiNE
+users on many AFFiNE domains through one deployment. Process-level AFFiNE
+credentials and `AFFINE_HEADERS_JSON` are ignored, and the `sign_in` tool is not
+registered.
+
+Your application authenticates to this server with
+`Authorization: Bearer <AFFINE_MCP_HTTP_TOKEN>` and describes the user in the
+headers of the MCP `initialize` request. The session keeps that identity for its
+lifetime; headers on later requests are ignored.
+
+| Header | Notes |
+| --- | --- |
+| `X-Affine-Url` | AFFiNE base URL. HTTPS only (unless `AFFINE_ALLOW_INSECURE_HTTP=true`); the host must match `AFFINE_MCP_TENANT_ALLOWED_HOSTS` |
+| `X-Affine-Email` + `X-Affine-Password` | Signs in and renews the session automatically. Use `X-Affine-Password-B64` (UTF-8, base64) for non-ASCII passwords |
+| `X-Affine-Cookie` | A signed-in session `Cookie` header. Not renewed |
+| `X-Affine-Token` | A bearer token accepted by that AFFiNE server |
+| `X-Affine-Workspace-Id` | Optional default workspace |
+
+Send exactly one credential method. Bad headers return `400`, a host outside the
+allowlist `403`, and a failed AFFiNE sign-in `401`, all at `initialize`. Email
+and password sessions sign in during `initialize`, so wrong credentials fail
+immediately.
+
+Operational notes:
+
+- The allowlist is the only thing stopping this server from forwarding user
+  credentials to an arbitrary host. Keep it as narrow as your tenants allow.
+- Passwords stay in process memory for the life of the session so the AFFiNE
+  session can renew. Sessions end after `AFFINE_MCP_HTTP_SESSION_IDLE_TIMEOUT_MS`
+  or an explicit `DELETE /mcp`; size `AFFINE_MCP_HTTP_MAX_SESSIONS` for your user
+  count.
+- Tool exposure (`AFFINE_TOOL_PROFILE`, `AFFINE_DISABLED_GROUPS`) is set per
+  deployment and applies to every tenant.
+- Keep the deployment behind HTTPS, and do not expose it to end users directly:
+  `AFFINE_MCP_HTTP_TOKEN` identifies your application, not an individual user.
+- `/readyz` does not probe an upstream, because destinations are per session.

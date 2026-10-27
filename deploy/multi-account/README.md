@@ -26,3 +26,10 @@ Satu container per akun, jadi kredensial dan profil tool terisolasi.
 Catatan: pakai akun AFFiNE khusus berhak minimal, token MCP unik per akun,
 dan buka `destructive`/`admin` hanya bila memang perlu.
 Nama grup di `AFFINE_DISABLED_GROUPS` mengikuti README utama.
+
+## Banyak pengguna dan domain dalam satu deployment
+
+Kalau akunnya dikelola aplikasi Anda dan jumlahnya banyak, jangan buat container per akun.
+Pakai mode multi-tenant (`AFFINE_MCP_MULTI_TENANT=true`): aplikasi mengirim domain dan
+kredensial pengguna di header saat `initialize`. Lihat bagian "Multi-tenant mode" di
+`docs/configuration-and-deployment.md`.

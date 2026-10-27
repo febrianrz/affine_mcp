@@ -10,6 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import type { ServerConfig } from "./config.js";
 import { registerHttpDiagnosticsRoutes } from "./httpDiagnostics.js";
+import { TenantError } from "./tenant.js";
 import { createHttpAuthState, registerHttpAuthRoutes } from "./httpAuth.js";
 import {
   isLoopbackHostname,
@@ -84,7 +85,7 @@ function closeHttpServer(server: HttpServer): Promise<void> {
 }
 
 export async function startHttpMcpServer(
-  createMcpServer: () => Promise<McpServer>,
+  createMcpServer: (req?: Request) => Promise<McpServer>,
   config: ServerConfig,
 ): Promise<HttpMcpServerHandle> {
   const runtimeConfig: HttpRuntimeConfig = loadHttpRuntimeConfig();
@@ -102,6 +103,12 @@ export async function startHttpMcpServer(
     "AFFINE_MCP_HTTP_ALLOW_QUERY_TOKEN",
     process.env.AFFINE_MCP_HTTP_ALLOW_QUERY_TOKEN,
   );
+
+  if (config.multiTenant && (allowUnauthenticated || allowQueryToken || !httpAuthToken)) {
+    throw new Error(
+      "Multi-tenant mode requires AFFINE_MCP_HTTP_TOKEN and does not allow unauthenticated access or query-string tokens.",
+    );
+  }
 
   if (config.authMode === "oauth" && allowUnauthenticated) {
     throw new Error(
@@ -393,7 +400,7 @@ export async function startHttpMcpServer(
           }
         };
 
-        const mcpServer = await createMcpServer();
+        const mcpServer = await createMcpServer(req);
         await mcpServer.connect(transport);
       } else if (sessionId && !existing) {
         sendJsonRpcError(res, 404, -32001, "Session not found");
@@ -424,6 +431,12 @@ export async function startHttpMcpServer(
         try {
           await newTransport.close();
         } catch {}
+      }
+      if (e instanceof TenantError) {
+        // Client error (bad/forbidden tenant headers or failed AFFiNE sign-in); never log credentials.
+        console.error(`[affine-mcp] Rejected /mcp session: ${e.message}`);
+        if (!res.headersSent) sendJsonRpcError(res, e.status, -32000, e.message);
+        return;
       }
       console.error("[affine-mcp] Error handling /mcp request:", e);
       if (!res.headersSent) {
@@ -463,7 +476,7 @@ export async function startHttpMcpServer(
         removeSession(sessionId, transport!);
       });
 
-      const mcpServer = await createMcpServer();
+      const mcpServer = await createMcpServer(req);
       await mcpServer.connect(transport);
       console.error(
         `[affine-mcp] Legacy SSE session established: ${sessionId}`,
@@ -474,6 +487,11 @@ export async function startHttpMcpServer(
         try {
           await transport.close();
         } catch {}
+      }
+      if (e instanceof TenantError) {
+        console.error(`[affine-mcp] Rejected SSE session: ${e.message}`);
+        if (!res.headersSent) res.status(e.status).send(e.message);
+        return;
       }
       console.error("[affine-mcp] Error establishing legacy SSE stream:", e);
       if (!res.headersSent)

@@ -78,6 +78,12 @@ export function registerHttpDiagnosticsRoutes(
       }
     }
 
+    if (config.multiTenant) {
+      // Destinations are chosen per session, so there is no single upstream to probe.
+      res.json({ status: "ok", authMode: config.authMode, upstream: "per-tenant" });
+      return;
+    }
+
     try {
       await probeAffineGraphql(config);
       res.json({

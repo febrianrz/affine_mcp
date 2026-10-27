@@ -62,6 +62,8 @@ export type ServerConfig = {
   loginAtStart: LoginAtStartMode;
   http: HttpServerConfig;
   oauthAllowServiceWrites: boolean;
+  /** One deployment serves many AFFiNE users/domains; credentials arrive per MCP session. */
+  multiTenant: boolean;
 };
 
 /** Config file location: $XDG_CONFIG_HOME/affine-mcp/config, or ~/.config/affine-mcp/config by default. */
@@ -437,6 +439,7 @@ export function loadConfig(): ServerConfig {
     env("AFFINE_OAUTH_ALLOW_SERVICE_WRITES", file),
     false,
   );
+  const multiTenant = parseBooleanFlag("AFFINE_MCP_MULTI_TENANT", env("AFFINE_MCP_MULTI_TENANT", file));
 
   return {
     baseUrl,
@@ -459,5 +462,6 @@ export function loadConfig(): ServerConfig {
     loginAtStart,
     http,
     oauthAllowServiceWrites,
+    multiTenant,
   };
 }

@@ -19,6 +19,13 @@ import { registerPropertyTools } from "./tools/properties.js";
 import { registerIconTools } from "./tools/icons.js";
 import { runCli } from "./cli.js";
 import { startHttpMcpServer } from "./sse.js";
+import { parseBooleanFlag } from "./networkSecurity.js";
+import {
+  parseTenantAllowedHosts,
+  resolveTenantFromHeaders,
+  TenantError,
+  type TenantContext,
+} from "./tenant.js";
 import { existsSync } from "fs";
 import { createToolFilter, toolAnnotationsFor } from "./toolSurface.js";
 import { toolOutputSchemaFor } from "./toolOutputSchemas.js";
@@ -73,6 +80,35 @@ const toolFilterEnvironment = createToolFilterEnvironment(config.authMode, proce
 // Tool filtering is parsed once at module load (not per-session in HTTP mode).
 const toolFilter = createToolFilter(toolFilterEnvironment);
 
+// Multi-tenant: every MCP session brings its own AFFiNE domain and credentials,
+// so the process-wide AFFiNE credentials below are never used for tool calls.
+const tenantAllowedHosts = config.multiTenant
+  ? parseTenantAllowedHosts(process.env.AFFINE_MCP_TENANT_ALLOWED_HOSTS)
+  : [];
+const tenantAllowInsecureHttp = parseBooleanFlag(
+  "AFFINE_ALLOW_INSECURE_HTTP",
+  process.env.AFFINE_ALLOW_INSECURE_HTTP,
+);
+if (config.multiTenant) {
+  if (!useHttpTransport) {
+    throw new Error("AFFINE_MCP_MULTI_TENANT=true requires MCP_TRANSPORT=http.");
+  }
+  if (config.authMode === "oauth") {
+    throw new Error("AFFINE_MCP_MULTI_TENANT=true is not compatible with AFFINE_MCP_AUTH_MODE=oauth.");
+  }
+  if (tenantAllowedHosts.length === 0) {
+    throw new Error(
+      "AFFINE_MCP_MULTI_TENANT=true requires AFFINE_MCP_TENANT_ALLOWED_HOSTS " +
+      "(comma-separated AFFiNE hostnames, e.g. affine.example.com,*.team.example.com).",
+    );
+  }
+  if (!config.http.authToken) {
+    throw new Error(
+      "AFFINE_MCP_MULTI_TENANT=true requires AFFINE_MCP_HTTP_TOKEN so only your application can open sessions.",
+    );
+  }
+}
+
 if (config.authMode === "oauth" && !useHttpTransport) {
   throw new Error("AFFINE_MCP_AUTH_MODE=oauth requires MCP_TRANSPORT=http (or streamable/sse).");
 }
@@ -107,16 +143,26 @@ if (config.authMode === "oauth" && !authSession.hasConfiguredAuth) {
 config.email = undefined;
 config.password = undefined;
 
-if (loginMode === "async" && authSession.requiresLogin) {
+if (!config.multiTenant && loginMode === "async" && authSession.requiresLogin) {
   authSession.start();
 }
 
 // Startup diagnostics (visible in Claude Code MCP server logs via stderr)
 console.error(`[affine-mcp] Config: ${CONFIG_FILE} (${existsSync(CONFIG_FILE) ? 'found' : 'missing'})`);
-console.error(`[affine-mcp] Endpoint: ${config.graphqlEndpoint}`);
+if (config.multiTenant) {
+  console.error(
+    `[affine-mcp] Multi-tenant mode: per-session AFFiNE URL and credentials; ` +
+    `allowed hosts: ${tenantAllowedHosts.join(", ")}`,
+  );
+  if (authSession.hasConfiguredAuth) {
+    console.error("[affine-mcp] Process-level AFFiNE credentials are ignored in multi-tenant mode.");
+  }
+} else {
+  console.error(`[affine-mcp] Endpoint: ${config.graphqlEndpoint}`);
+}
 const authSource = authSession.hasConfiguredAuth ? authSession.source : "not configured";
-console.error(`[affine-mcp] Auth: ${authSource}`);
-if (authSource === "not configured") {
+if (!config.multiTenant) console.error(`[affine-mcp] Auth: ${authSource}`);
+if (!config.multiTenant && authSource === "not configured") {
   console.error("[affine-mcp] WARNING: No authentication configured. Some operations may fail.");
   console.error("[affine-mcp] Set AFFINE_EMAIL and AFFINE_PASSWORD, AFFINE_COOKIE, or run: affine-mcp login");
 }
@@ -140,16 +186,50 @@ if (
   );
 }
 
-async function buildServer() {
+/** Build the per-session AFFiNE identity for multi-tenant mode and verify it signs in. */
+async function authenticateTenant(tenant: TenantContext): Promise<AuthSession> {
+  const { auth } = tenant;
+  const session = new AuthSession({
+    baseUrl: tenant.baseUrl,
+    bearer: auth.kind === "bearer" ? auth.token : undefined,
+    cookie: auth.kind === "cookie" ? auth.cookie : undefined,
+    email: auth.kind === "password" ? auth.email : undefined,
+    password: auth.kind === "password" ? auth.password : undefined,
+  });
+  if (auth.kind === "password") {
+    // Fail the MCP initialize with a clear status instead of a later tool error.
+    try {
+      await session.ready();
+    } catch {
+      throw new TenantError(401, `AFFiNE sign-in failed for ${new URL(tenant.baseUrl).hostname}.`);
+    }
+  }
+  return session;
+}
+
+async function buildServer(req?: { headers: Record<string, string | string[] | undefined> }) {
+  const tenant = config.multiTenant
+    ? resolveTenantFromHeaders(req?.headers ?? {}, {
+        allowedHosts: tenantAllowedHosts,
+        allowInsecureHttp: tenantAllowInsecureHttp,
+        graphqlPath: config.graphqlPath,
+      })
+    : undefined;
+  const baseUrl = tenant?.baseUrl ?? config.baseUrl;
+  const graphqlEndpoint = tenant?.graphqlEndpoint ?? config.graphqlEndpoint;
+  const defaultWorkspaceId = tenant ? tenant.workspaceId : config.defaultWorkspaceId;
+  const sessionAuth = tenant ? await authenticateTenant(tenant) : authSession;
+
   const server = new McpServer({ name: "affine-mcp", version: VERSION });
-  const gqlHeaders = { ...(config.headers || {}) };
+  // Never inherit process-level headers in multi-tenant mode: they may carry another identity.
+  const gqlHeaders = tenant ? {} : { ...(config.headers || {}) };
 
   // Initialize GraphQL client with authentication
   const gql = new GraphQLClient({
-    endpoint: config.graphqlEndpoint,
-    baseUrl: config.baseUrl,
+    endpoint: graphqlEndpoint,
+    baseUrl,
     headers: gqlHeaders,
-    authProvider: () => authSession.ready(),
+    authProvider: () => sessionAuth.ready(),
   });
 
 
@@ -164,7 +244,7 @@ async function buildServer() {
       if (!toolFilter.isEnabled(name)) return;
       const outputSchema = options?.outputSchema ?? toolOutputSchemaFor(name);
       const coordinated = coordinateTool(name, options?.inputSchema || {}, handler, {
-        gql, endpoint: config.graphqlEndpoint, workspaceId: config.defaultWorkspaceId,
+        gql, endpoint: graphqlEndpoint, workspaceId: defaultWorkspaceId,
       });
       return originalRegisterTool(name, {
         ...options,
@@ -188,18 +268,19 @@ async function buildServer() {
 
   registerWorkspaceTools(server, gql);
   registerDocTools(server, gql, {
-    workspaceId: config.defaultWorkspaceId,
+    workspaceId: defaultWorkspaceId,
     toolSurface: { profile: toolFilter.profile, enabledTools: toolFilter.enabledTools },
   });
-  registerCommentTools(server, gql, { workspaceId: config.defaultWorkspaceId });
-  registerHistoryTools(server, gql, { workspaceId: config.defaultWorkspaceId });
-  registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
-  registerPropertyTools(server, gql, { workspaceId: config.defaultWorkspaceId });
-  registerIconTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  registerCommentTools(server, gql, { workspaceId: defaultWorkspaceId });
+  registerHistoryTools(server, gql, { workspaceId: defaultWorkspaceId });
+  registerOrganizeTools(server, gql, { workspaceId: defaultWorkspaceId });
+  registerPropertyTools(server, gql, { workspaceId: defaultWorkspaceId });
+  registerIconTools(server, gql, { workspaceId: defaultWorkspaceId });
   registerUserTools(server, gql);
   registerUserCRUDTools(server, gql);
-  if (config.authMode !== "oauth") {
-    registerAuthTools(server, gql, config.baseUrl);
+  // sign_in would let a session swap to another identity, so it is off in multi-tenant mode.
+  if (config.authMode !== "oauth" && !tenant) {
+    registerAuthTools(server, gql, baseUrl);
   }
   registerBlobTools(server, gql);
   registerNotificationTools(server, gql);
@@ -208,7 +289,7 @@ async function buildServer() {
 }
 
 async function start() {
-  if (loginMode === "sync" && authSession.requiresLogin) {
+  if (!config.multiTenant && loginMode === "sync" && authSession.requiresLogin) {
     await authSession.ready();
   }
 

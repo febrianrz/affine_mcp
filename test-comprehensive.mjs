@@ -1,0 +1,689 @@
+#!/usr/bin/env node
+import { testResourceName, testTempPath } from './tests/require-destructive-test-safety.mjs';
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+import { getToolResultError } from './tests/support/comprehensive-result.mjs';
+
+const MCP_SERVER_PATH = './dist/index.js';
+const BASE_URL = process.env.AFFINE_BASE_URL || 'http://localhost:3010';
+const EMAIL = process.env.AFFINE_EMAIL || process.env.AFFINE_ADMIN_EMAIL || 'test@affine.local';
+const PASSWORD = process.env.AFFINE_PASSWORD || process.env.AFFINE_ADMIN_PASSWORD;
+const LOGIN_MODE = process.env.AFFINE_LOGIN_AT_START || 'sync';
+const XDG_CONFIG_HOME = testTempPath('comprehensive-config');
+const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS || '60000');
+const MANIFEST_PATH = path.join(process.cwd(), 'tool-manifest.json');
+const EXPECTED_TOOLS = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8')).tools;
+const ASSUME_FOCUSED_COVERAGE = process.env.AFFINE_COMPREHENSIVE_ASSUME_FOCUSED_COVERAGE === 'true';
+const FOCUSED_TOOL_COVERAGE = new Map([
+  ['add_doc_to_collection', 'test-organize-tools.mjs'],
+  ['add_organize_link', 'test-organize-tools.mjs'],
+  ['analyze_doc_fidelity', 'test-capabilities-fidelity.mjs'],
+  ['append_semantic_section', 'test-semantic-page-composer.mjs'],
+  ['clear_doc_property', 'test-doc-properties.mjs'],
+  ['compose_database_from_intent', 'test-database-intent.mjs'],
+  ['create_collection', 'test-organize-tools.mjs'],
+  ['create_custom_property', 'test-doc-properties.mjs'],
+  ['create_folder', 'test-organize-tools.mjs'],
+  ['create_semantic_page', 'test-semantic-page-composer.mjs'],
+  ['create_workspace_blueprint', 'test-organize-tools.mjs'],
+  ['delete_collection', 'test-organize-tools.mjs'],
+  ['delete_custom_property', 'test-doc-properties.mjs'],
+  ['delete_database_row', 'test-database-cells.mjs'],
+  ['delete_folder', 'test-organize-tools.mjs'],
+  ['delete_organize_link', 'test-organize-tools.mjs'],
+  ['export_with_fidelity_report', 'test-capabilities-fidelity.mjs'],
+  ['find_doc_by_title', 'test-find-doc-by-title.mjs'],
+  ['get_capabilities', 'test-capabilities-fidelity.mjs'],
+  ['get_collection', 'test-organize-tools.mjs'],
+  ['get_doc_icon', 'test-icons.mjs'],
+  ['get_folder_icon', 'test-icons.mjs'],
+  ['get_orphan_docs', 'test-create-placement.mjs'],
+  ['inspect_template_structure', 'test-native-template-instantiation.mjs'],
+  ['instantiate_template_native', 'test-native-template-instantiation.mjs'],
+  ['list_children', 'test-create-placement.mjs'],
+  ['list_collections', 'test-organize-tools.mjs'],
+  ['list_doc_properties', 'test-doc-properties.mjs'],
+  ['list_organize_nodes', 'test-organize-tools.mjs'],
+  ['list_workspace_tree', 'test-create-placement.mjs'],
+  ['move_block', 'test-block-editing.mjs'],
+  ['move_doc', 'test-organize-tools.mjs'],
+  ['move_organize_node', 'test-organize-tools.mjs'],
+  ['remove_doc_from_collection', 'test-organize-tools.mjs'],
+  ['rename_folder', 'test-organize-tools.mjs'],
+  ['restore_doc', 'test-doc-discovery.mjs'],
+  ['search_docs', 'test-doc-discovery.mjs'],
+  ['set_doc_journal', 'test-doc-properties.mjs'],
+  ['set_doc_property', 'test-doc-properties.mjs'],
+  ['trash_doc', 'test-doc-discovery.mjs'],
+  ['update_block', 'test-block-editing.mjs'],
+  ['update_collection', 'test-organize-tools.mjs'],
+  ['update_collection_rules', 'test-organize-tools.mjs'],
+  ['update_doc_icon', 'test-icons.mjs'],
+  ['update_doc_title', 'test-create-placement.mjs'],
+  ['update_folder_icon', 'test-icons.mjs'],
+  ['update_table_cell', 'test-block-editing.mjs'],
+]);
+
+if (!PASSWORD) {
+  throw new Error(
+    'AFFINE_PASSWORD or AFFINE_ADMIN_PASSWORD env var required. Prefer `npm run test:comprehensive` for self-bootstrapping local validation.'
+  );
+}
+
+function parseContent(result) {
+  const text = result?.content?.[0]?.text;
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function isBlockedByEnvironment(_toolName, errorMessage) {
+  if (!errorMessage) return false;
+  return false;
+}
+
+function redactSecrets(value) {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (!value || typeof value !== 'object') return value;
+
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
+    if (/^(password|token|cookie|authorization|apiToken|accessToken|refreshToken)$/i.test(key)) {
+      return [key, '[redacted]'];
+    }
+    return [key, redactSecrets(entry)];
+  }));
+}
+
+class ComprehensiveRunner {
+  constructor() {
+    this.client = new Client({ name: 'affine-mcp-comprehensive-test', version: '3.0.0' });
+    this.transport = new StdioClientTransport({
+      command: 'node',
+      args: [MCP_SERVER_PATH],
+      cwd: process.cwd(),
+      env: {
+        AFFINE_BASE_URL: BASE_URL,
+        AFFINE_EMAIL: EMAIL,
+        AFFINE_PASSWORD: PASSWORD,
+        AFFINE_LOGIN_AT_START: LOGIN_MODE,
+        XDG_CONFIG_HOME,
+      },
+      stderr: 'pipe',
+    });
+
+    this.results = [];
+    this.called = new Set();
+    this.serverTools = [];
+
+    this.workspaceId = null;
+    this.docId = null;
+    this.markdownDocId = null;
+    this.commentId = null;
+    this.blobKey = null;
+  }
+
+  async start() {
+    this.transport.stderr?.on('data', chunk => {
+      process.stderr.write(`[server] ${chunk}`);
+    });
+    await this.client.connect(this.transport);
+    const tools = await this.client.listTools();
+    this.serverTools = tools.tools.map(t => t.name).sort();
+  }
+
+  async stop() {
+    await this.transport.close();
+  }
+
+  async callTool(name, args = {}, after) {
+    this.called.add(name);
+
+    const record = {
+      name,
+      args: redactSecrets(args),
+      ok: false,
+      blocked: false,
+      durationMs: 0,
+      error: null,
+      result: null,
+    };
+
+    const start = Date.now();
+
+    if (!this.serverTools.includes(name)) {
+      record.error = 'Tool is not registered on server';
+      this.results.push(record);
+      return record;
+    }
+
+    try {
+      const result = await this.client.callTool(
+        { name, arguments: args },
+        undefined,
+        { timeout: TOOL_TIMEOUT_MS }
+      );
+      const parsed = parseContent(result);
+      const semanticError = getToolResultError(result, parsed);
+      record.result = redactSecrets(parsed);
+      record.durationMs = Date.now() - start;
+
+      if (semanticError) {
+        if (isBlockedByEnvironment(name, semanticError)) {
+          record.ok = true;
+          record.blocked = true;
+          record.error = semanticError;
+        } else {
+          record.ok = false;
+          record.error = semanticError;
+        }
+      } else {
+        record.ok = true;
+      }
+
+      if (after && record.ok) {
+        try {
+          after(parsed);
+        } catch (error) {
+          record.ok = false;
+          record.error = `Post-processing failed: ${error?.message || String(error)}`;
+        }
+      }
+    } catch (error) {
+      record.durationMs = Date.now() - start;
+      record.ok = false;
+      record.error = error?.message || String(error);
+    }
+
+    this.results.push(record);
+    return record;
+  }
+
+  async run() {
+    await this.start();
+
+    const missingFromServer = EXPECTED_TOOLS.filter(name => !this.serverTools.includes(name));
+    const extraOnServer = this.serverTools.filter(name => !EXPECTED_TOOLS.includes(name));
+    if (missingFromServer.length || extraOnServer.length) {
+      throw new Error(
+        `Tool list mismatch. missing=${JSON.stringify(missingFromServer)} extra=${JSON.stringify(extraOnServer)}`
+      );
+    }
+
+    await this.callTool('current_user');
+    await this.callTool('sign_in', { email: EMAIL, password: PASSWORD });
+
+    await this.callTool('list_workspaces');
+    await this.callTool('create_workspace', { name: testResourceName('mcp-main') }, parsed => {
+      this.workspaceId = parsed?.id || null;
+    });
+
+    const workspaceId = this.workspaceId;
+    if (!workspaceId) {
+      throw new Error('create_workspace did not return workspace id');
+    }
+
+    await this.callTool('get_workspace', { id: workspaceId });
+    await this.callTool('update_workspace', { id: workspaceId, public: false, enableAi: true });
+
+    await this.callTool('list_docs', { workspaceId, first: 20 });
+    await this.callTool('create_doc', { workspaceId, title: 'Main Doc', content: 'main content' }, parsed => {
+      this.docId = parsed?.docId || null;
+    });
+    await this.callTool(
+      'create_doc_from_markdown',
+      {
+        workspaceId,
+        markdown: '# Markdown Doc\\n\\n- [x] Imported todo\\n\\n```ts\\nconsole.log(\"hello\")\\n```',
+      },
+      parsed => {
+        this.markdownDocId = parsed?.docId || null;
+      }
+    );
+
+    const docId = this.docId;
+    if (!docId) {
+      throw new Error('create_doc did not return docId');
+    }
+    const tagName = testResourceName('mcp-tag');
+
+    await this.callTool('create_tag', { workspaceId, tag: tagName });
+    await this.callTool('add_tag_to_doc', { workspaceId, docId, tag: tagName });
+    await this.callTool('list_tags', { workspaceId }, parsed => {
+      const tags = Array.isArray(parsed?.tags) ? parsed.tags : [];
+      if (!tags.some(entry => entry?.name === tagName)) {
+        throw new Error('list_tags did not include created tag');
+      }
+    });
+    await this.callTool('list_docs_by_tag', { workspaceId, tag: tagName }, parsed => {
+      const docs = Array.isArray(parsed?.docs) ? parsed.docs : [];
+      if (!docs.some(entry => entry?.id === docId)) {
+        throw new Error('list_docs_by_tag did not include tagged doc');
+      }
+    });
+    await this.callTool('list_docs', { workspaceId, first: 20 }, parsed => {
+      const edges = Array.isArray(parsed?.edges) ? parsed.edges : [];
+      const mainDoc = edges.map(edge => edge?.node).find(node => node?.id === docId);
+      if (!mainDoc) {
+        throw new Error('list_docs did not include created doc');
+      }
+      if (!Array.isArray(mainDoc.tags) || !mainDoc.tags.includes(tagName)) {
+        throw new Error('list_docs did not include tags for created doc');
+      }
+    });
+
+    await this.callTool('get_doc', { workspaceId, docId });
+    await this.callTool('publish_doc', { workspaceId, docId });
+    await this.callTool('revoke_doc', { workspaceId, docId });
+    await this.callTool('append_block', { workspaceId, docId, type: 'paragraph', text: 'appended from test' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'heading2', text: 'Heading from append_block' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'quote', text: 'Quote from append_block' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'bulleted_list', text: 'Bulleted item from append_block' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'numbered_list', text: 'Numbered item from append_block' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'todo', text: 'Todo item from append_block', checked: true });
+    await this.callTool('append_block', { workspaceId, docId, type: 'code', text: 'console.log(\"append_block\");', language: 'javascript' });
+    await this.callTool('append_block', { workspaceId, docId, type: 'divider' });
+    const tableData = [['Width header', 'Keep this cell'], ['Width row', 'Keep this content']];
+    let tableBlockId = null;
+    await this.callTool('append_block', {
+      workspaceId,
+      docId,
+      type: 'table',
+      rows: tableData.length,
+      columns: tableData[0].length,
+      tableData,
+    }, parsed => {
+      tableBlockId = parsed?.blockId || null;
+    });
+    if (!tableBlockId) {
+      throw new Error('append_block(table) did not return blockId');
+    }
+    const explicitWidths = [240, 360];
+    await this.callTool('update_table_column_widths', {
+      workspaceId,
+      docId,
+      blockId: tableBlockId,
+      widths: explicitWidths,
+    }, parsed => {
+      if (parsed?.updated !== true || JSON.stringify(parsed.table?.widths) !== JSON.stringify(explicitWidths)) {
+        throw new Error('update_table_column_widths did not apply explicit widths');
+      }
+    });
+    await this.callTool('read_doc', { workspaceId, docId }, parsed => {
+      const table = parsed?.blocks?.find(block => block.id === tableBlockId);
+      if (!table) {
+        throw new Error('read_doc did not return the resized table');
+      }
+      if (JSON.stringify(table.tableColumnWidths) !== JSON.stringify(explicitWidths)) {
+        throw new Error('read_doc did not persist explicit table column widths');
+      }
+      if (JSON.stringify(table.tableData) !== JSON.stringify(tableData)) {
+        throw new Error('table column widths changed table cell content');
+      }
+    });
+    const automaticWidths = [null, null];
+    await this.callTool('update_table_column_widths', {
+      workspaceId,
+      docId,
+      blockId: tableBlockId,
+      widths: automaticWidths,
+    }, parsed => {
+      if (parsed?.updated !== true || JSON.stringify(parsed.table?.widths) !== JSON.stringify(automaticWidths)) {
+        throw new Error('update_table_column_widths did not restore automatic widths');
+      }
+    });
+    await this.callTool('read_doc', { workspaceId, docId }, parsed => {
+      const table = parsed?.blocks?.find(block => block.id === tableBlockId);
+      if (!table) {
+        throw new Error('read_doc did not return the restored table');
+      }
+      if (JSON.stringify(table.tableColumnWidths) !== JSON.stringify(automaticWidths)) {
+        throw new Error('read_doc did not restore automatic table column widths');
+      }
+      if (JSON.stringify(table.tableData) !== JSON.stringify(tableData)) {
+        throw new Error('restoring automatic widths changed table cell content');
+      }
+    });
+    let databaseBlockId = null;
+    await this.callTool('append_block', { workspaceId, docId, type: 'database' }, parsed => {
+      databaseBlockId = parsed?.blockId || null;
+    });
+    if (!databaseBlockId) {
+      throw new Error('append_block(database) did not return blockId');
+    }
+    const databaseColumnName = testResourceName('status');
+    let databaseRowBlockId = null;
+    await this.callTool('add_database_column', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+      name: databaseColumnName,
+      type: 'select',
+      options: ['Todo', 'Done'],
+    });
+    await this.callTool('read_database_columns', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+    }, parsed => {
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('read_database_columns did not return JSON payload');
+      }
+      if (!Array.isArray(parsed.columns) || parsed.columns.length === 0) {
+        throw new Error('read_database_columns returned no columns');
+      }
+      const schemaColumn = parsed.columns.find(entry => entry?.name === databaseColumnName);
+      if (!schemaColumn) {
+        throw new Error('read_database_columns did not include the created column');
+      }
+    });
+    await this.callTool('add_database_row', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+      cells: {
+        [databaseColumnName]: 'Todo',
+      },
+    }, parsed => {
+      databaseRowBlockId = parsed?.rowBlockId || null;
+    });
+    if (!databaseRowBlockId) {
+      throw new Error('add_database_row did not return rowBlockId');
+    }
+    await this.callTool('read_database_cells', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+    }, parsed => {
+      if (!Array.isArray(parsed?.rows) || parsed.rows.length !== 1) {
+        throw new Error('read_database_cells did not return the expected single row');
+      }
+      if (parsed.rows[0]?.cells?.[databaseColumnName]?.value !== 'Todo') {
+        throw new Error('read_database_cells did not expose the created row value');
+      }
+    });
+    await this.callTool('update_database_row', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+      rowBlockId: databaseRowBlockId,
+      cells: {
+        [databaseColumnName]: 'Done',
+      },
+      createOption: false,
+    });
+    await this.callTool('update_database_row', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+      rowBlockId: databaseRowBlockId,
+      cells: {
+        title: 'Comprehensive Row',
+        [databaseColumnName]: 'Todo',
+      },
+      createOption: false,
+    });
+    await this.callTool('read_database_cells', {
+      workspaceId,
+      docId,
+      databaseBlockId,
+      rowBlockIds: [databaseRowBlockId],
+    }, parsed => {
+      if (!Array.isArray(parsed?.rows) || parsed.rows.length !== 1) {
+        throw new Error('read_database_cells row filter did not return the updated row');
+      }
+      if (parsed.rows[0]?.title !== 'Comprehensive Row') {
+        throw new Error('update_database_row did not persist the row title');
+      }
+      if (parsed.rows[0]?.cells?.[databaseColumnName]?.value !== 'Todo') {
+        throw new Error('update_database_row did not persist the cell value');
+      }
+    });
+    await this.callTool('append_markdown', {
+      workspaceId,
+      docId,
+      markdown: '## Appended Heading\\n\\n- appended list item\\n\\n[link](https://example.com)',
+    });
+    await this.callTool('export_doc_markdown', {
+      workspaceId,
+      docId,
+      includeFrontmatter: true,
+    });
+    await this.callTool('replace_doc_with_markdown', {
+      workspaceId,
+      docId,
+      markdown: '# Replaced Content\\n\\nParagraph after replace.',
+    });
+    await this.callTool('read_doc', { workspaceId, docId }, parsed => {
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('read_doc did not return JSON payload');
+      }
+      if (!Array.isArray(parsed.blocks) || parsed.blocks.length === 0) {
+        throw new Error('read_doc returned no blocks');
+      }
+      if (!Array.isArray(parsed.tags) || !parsed.tags.includes(tagName)) {
+        throw new Error('read_doc tags did not include assigned tag');
+      }
+    });
+    await this.callTool('remove_tag_from_doc', { workspaceId, docId, tag: tagName });
+    await this.callTool('delete_tag', { workspaceId, tag: tagName });
+
+    await this.callTool('list_comments', { workspaceId, docId, first: 20 });
+    await this.callTool('create_comment', {
+      workspaceId,
+      docId,
+      docTitle: 'Main Doc',
+      docMode: 'page',
+      content: { text: 'comment-main' },
+    }, parsed => {
+      this.commentId = parsed?.id || null;
+    });
+
+    await this.callTool('update_comment', { id: this.commentId || 'missing-comment-id', content: { text: 'updated-main' } });
+    await this.callTool('resolve_comment', { id: this.commentId || 'missing-comment-id', resolved: true });
+    await this.callTool('delete_comment', { id: this.commentId || 'missing-comment-id' });
+
+    await this.callTool('list_histories', { workspaceId, guid: docId, take: 20 });
+
+    await this.callTool('list_notifications', { first: 20 });
+    await this.callTool('read_all_notifications');
+
+    await this.callTool('upload_blob', {
+      workspaceId,
+      content: 'Blob data from test',
+      filename: 'test.txt',
+      contentType: 'text/plain',
+    }, parsed => {
+      this.blobKey = parsed?.key || parsed?.id || null;
+    });
+    await this.callTool('delete_blob', {
+      workspaceId,
+      key: this.blobKey || 'missing-blob-key',
+      permanently: true,
+      confirmKey: this.blobKey || 'missing-blob-key',
+    });
+    await this.callTool('cleanup_blobs', { workspaceId, confirmWorkspaceId: workspaceId });
+
+    await this.callTool('update_profile', { name: 'Dev User' });
+    await this.callTool('update_settings', { settings: { receiveCommentEmail: true } });
+
+    let frameBlockId = null;
+    let noteBlockId = null;
+    let shapeAId = null;
+    let shapeBId = null;
+    await this.callTool(
+      'append_block',
+      { workspaceId, docId, type: 'frame', text: 'Edgeless Frame', x: 100, y: 100, width: 600, height: 400 },
+      parsed => { frameBlockId = parsed?.blockId || null; }
+    );
+    if (!frameBlockId) throw new Error('append_block(frame) did not return blockId');
+    await this.callTool(
+      'append_block',
+      { workspaceId, docId, type: 'note', text: 'Edgeless Note', x: 120, y: 140, width: 400, height: 200 },
+      parsed => { noteBlockId = parsed?.blockId || null; }
+    );
+    if (!noteBlockId) throw new Error('append_block(note) did not return blockId');
+    await this.callTool(
+      'add_surface_element',
+      { workspaceId, docId, type: 'shape', shapeType: 'rect', x: 200, y: 600, width: 120, height: 80, text: 'A' },
+      parsed => { shapeAId = parsed?.elementId || null; }
+    );
+    if (!shapeAId) throw new Error('add_surface_element(shape A) did not return elementId');
+    await this.callTool(
+      'add_surface_element',
+      { workspaceId, docId, type: 'shape', shapeType: 'ellipse', x: 400, y: 620, width: 120, height: 80, text: 'B' },
+      parsed => { shapeBId = parsed?.elementId || null; }
+    );
+    if (!shapeBId) throw new Error('add_surface_element(shape B) did not return elementId');
+    await this.callTool('add_surface_element', {
+      workspaceId, docId, type: 'connector',
+      sourceId: shapeAId, targetId: shapeBId, label: 'flows to',
+    });
+    await this.callTool('update_surface_element', {
+      workspaceId, docId, elementId: shapeAId, text: 'A-updated',
+    });
+    await this.callTool('list_surface_elements', { workspaceId, docId }, parsed => {
+      if (!parsed || !Array.isArray(parsed.elements)) {
+        throw new Error('list_surface_elements did not return elements[]');
+      }
+    });
+    await this.callTool('update_edgeless_block', {
+      workspaceId, docId, blockId: noteBlockId, x: 150, y: 170,
+    });
+    await this.callTool('update_frame_children', {
+      workspaceId, docId, blockId: frameBlockId, childElementIds: [shapeAId, shapeBId, noteBlockId],
+    });
+    await this.callTool('get_edgeless_canvas', { workspaceId, docId }, parsed => {
+      if (!parsed || !Array.isArray(parsed.edgelessBlocks) || !Array.isArray(parsed.surfaceElements)) {
+        throw new Error('get_edgeless_canvas did not return expected shape');
+      }
+    });
+
+    // Exercise the native tools against persisted AFFiNE documents as well as pure Yjs fixtures.
+    let mindmapId, rootId, branchId, childId;
+    await this.callTool('create_mindmap', { workspaceId, docId, text: 'Release checks' }, parsed => {
+      mindmapId = parsed?.mindmapId;
+      rootId = parsed?.rootId;
+    });
+    if (!mindmapId || !rootId) throw new Error('create_mindmap did not return native IDs');
+    const mindmapTarget = { workspaceId, docId, mindmapId };
+    await this.callTool('add_mindmap_node', { ...mindmapTarget, parentId: rootId, text: 'Branch' }, parsed => {
+      branchId = parsed?.nodeId;
+    });
+    await this.callTool('add_mindmap_node', { ...mindmapTarget, parentId: rootId, text: 'Child' }, parsed => {
+      childId = parsed?.nodeId;
+    });
+    if (!branchId || !childId) throw new Error('add_mindmap_node did not return node IDs');
+    await this.callTool('update_mindmap_node', { ...mindmapTarget, nodeId: childId, text: 'Verified child', collapsed: true });
+    await this.callTool('reparent_mindmap_node', { ...mindmapTarget, nodeId: childId, parentId: branchId });
+    await this.callTool('set_mindmap_style', { ...mindmapTarget, style: 2 });
+    await this.callTool('set_mindmap_layout', { ...mindmapTarget, layout: 'left' });
+    await this.callTool('set_mindmap_lock', { ...mindmapTarget, locked: true });
+    await this.callTool('get_mindmap', mindmapTarget, parsed => {
+      const child = parsed?.nodes?.find(node => node.nodeId === childId);
+      if (
+        parsed?.nodeCount !== 3 || parsed.layout !== 'left' || parsed.style !== 2 || !parsed.locked ||
+        child?.parentId !== branchId || child.text !== 'Verified child' || child.collapsed !== true
+      ) {
+        throw new Error('Native mindmap hierarchy, edits, style, layout, or lock did not survive read-back');
+      }
+    });
+    await this.callTool('delete_surface_element', { workspaceId, docId, elementId: shapeBId });
+    await this.callTool('delete_block', { workspaceId, docId, blockId: noteBlockId });
+
+    await this.callTool('delete_doc', { workspaceId, docId, confirmDocId: docId });
+    await this.callTool('delete_workspace', { id: workspaceId, confirmWorkspaceId: workspaceId });
+
+    const uncalledTools = this.serverTools.filter(name => !this.called.has(name));
+    for (const name of uncalledTools) {
+      const focusedCoverage = FOCUSED_TOOL_COVERAGE.get(name);
+      if (ASSUME_FOCUSED_COVERAGE && focusedCoverage) {
+        this.results.push({
+          name,
+          args: {},
+          ok: true,
+          blocked: false,
+          durationMs: 0,
+          error: null,
+          result: {
+            coveredBy: focusedCoverage,
+            note: 'Covered by a focused regression in tests/run-comprehensive.sh',
+          },
+        });
+        continue;
+      }
+
+      this.results.push({
+        name,
+        args: {},
+        ok: false,
+        blocked: false,
+        durationMs: 0,
+        error: 'Tool was never called by the comprehensive test',
+        result: null,
+      });
+    }
+  }
+
+  summary() {
+    const total = this.results.length;
+    const passed = this.results.filter(r => r.ok).length;
+    const blocked = this.results.filter(r => r.blocked).length;
+    const failed = this.results.filter(r => !r.ok).length;
+
+    return {
+      generatedAt: new Date().toISOString(),
+      server: {
+        baseUrl: BASE_URL,
+        email: EMAIL,
+      },
+      tools: {
+        listed: this.serverTools.length,
+        called: this.called.size,
+      },
+      totals: { total, passed, failed, blocked },
+      results: this.results,
+    };
+  }
+}
+
+async function main() {
+  console.log('Starting comprehensive AFFiNE MCP server test...');
+  const runner = new ComprehensiveRunner();
+
+  try {
+    await runner.run();
+  } finally {
+    await runner.stop();
+  }
+
+  const summary = runner.summary();
+  const fileName = `${testResourceName('comprehensive-test-results')}.json`;
+  fs.writeFileSync(fileName, JSON.stringify(summary, null, 2));
+
+  console.log(JSON.stringify({
+    listedTools: summary.tools.listed,
+    calledTools: summary.tools.called,
+    totalChecks: summary.totals.total,
+    passed: summary.totals.passed,
+    blocked: summary.totals.blocked,
+    failed: summary.totals.failed,
+    resultsFile: fileName,
+  }, null, 2));
+
+  if (summary.totals.failed > 0) {
+    process.exit(1);
+  }
+}
+
+main().catch(error => {
+  console.error('Comprehensive test failed:', error);
+  process.exit(1);
+});

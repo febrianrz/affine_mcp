@@ -1,0 +1,313 @@
+#!/usr/bin/env node
+import { testResourceName, testTempPath } from './require-destructive-test-safety.mjs';
+
+/**
+ * Focused integration test for document discovery helpers.
+ *
+ * Covers:
+ * - list_docs should return titles from workspace metadata when GraphQL omits them
+ * - search_docs should support exact/prefix matching, tag filtering, and updatedAt sorting
+ * - trash_doc and restore_doc should preserve content and update discovery metadata
+ * - list_docs should correct stale count metadata after delete_doc removes a document
+ */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MCP_SERVER_PATH = path.resolve(__dirname, "..", "dist", "index.js");
+
+const BASE_URL = process.env.AFFINE_BASE_URL || "http://localhost:3010";
+const EMAIL = process.env.AFFINE_ADMIN_EMAIL || process.env.AFFINE_EMAIL || "test@affine.local";
+const PASSWORD = process.env.AFFINE_ADMIN_PASSWORD || process.env.AFFINE_PASSWORD;
+if (!PASSWORD) throw new Error("AFFINE_ADMIN_PASSWORD env var required — run: . tests/generate-test-env.sh");
+const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS || "60000");
+
+function parseContent(result) {
+  const text = result?.content?.[0]?.text;
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function expectTruthy(value, message) {
+  if (!value) {
+    throw new Error(`${message}: expected truthy value, got ${JSON.stringify(value)}`);
+  }
+}
+
+function expectEqual(actual, expected, message) {
+  if (actual !== expected) {
+    throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function expectIncludes(haystack, needle, message) {
+  if (!Array.isArray(haystack) || !haystack.includes(needle)) {
+    throw new Error(`${message}: expected ${JSON.stringify(haystack)} to include ${JSON.stringify(needle)}`);
+  }
+}
+
+async function delay(ms) {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function main() {
+  console.log("=== Document Discovery Integration Test ===");
+  console.log(`Base URL: ${BASE_URL}`);
+  console.log();
+
+  const client = new Client({ name: "affine-mcp-doc-discovery", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: "node",
+    args: [MCP_SERVER_PATH],
+    cwd: path.resolve(__dirname, ".."),
+    env: {
+      AFFINE_BASE_URL: BASE_URL,
+      AFFINE_EMAIL: EMAIL,
+      AFFINE_PASSWORD: PASSWORD,
+      AFFINE_LOGIN_AT_START: "sync",
+      XDG_CONFIG_HOME: testTempPath('doc-discovery-config'),
+    },
+    stderr: "pipe",
+  });
+
+  transport.stderr?.on("data", chunk => {
+    process.stderr.write(`[mcp-server] ${chunk}`);
+  });
+
+  async function call(toolName, args = {}) {
+    console.log(`  → ${toolName}(${JSON.stringify(args)})`);
+    const result = await client.callTool(
+      { name: toolName, arguments: args },
+      undefined,
+      { timeout: TOOL_TIMEOUT_MS },
+    );
+    if (result?.isError) {
+      throw new Error(`${toolName} MCP error: ${result?.content?.[0]?.text || "unknown"}`);
+    }
+    const parsed = parseContent(result);
+    if (parsed && typeof parsed === "object" && parsed.error) {
+      throw new Error(`${toolName} failed: ${parsed.error}`);
+    }
+    if (typeof parsed === "string" && /^(GraphQL error:|Error:|MCP error)/i.test(parsed)) {
+      throw new Error(`${toolName} failed: ${parsed}`);
+    }
+    console.log("    ✓ OK");
+    return parsed;
+  }
+
+  async function waitForListDocs(workspaceId, predicate, description, attempts = 20, delayMs = 1000) {
+    let lastResult = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      lastResult = await call("list_docs", { workspaceId, first: 50 });
+      if (predicate(lastResult)) {
+        return lastResult;
+      }
+      if (attempt < attempts) {
+        await delay(delayMs);
+      }
+    }
+    throw new Error(`${description}: timed out waiting for list_docs state. Last result: ${JSON.stringify(lastResult)}`);
+  }
+
+  await client.connect(transport);
+
+  try {
+    const timestamp = testResourceName('run');
+    const workspace = await call("create_workspace", { name: `doc-discovery-${timestamp}` });
+    expectTruthy(workspace?.id, "create_workspace id");
+
+    await call("update_doc_title", {
+      workspaceId: workspace.id,
+      docId: workspace.firstDocId,
+      title: "Workspace Home",
+    });
+
+    const listed = await call("list_docs", { workspaceId: workspace.id, first: 50 });
+    const listedTitles = listed?.edges?.map(edge => edge?.node?.title) || [];
+    expectIncludes(listedTitles, "Workspace Home", "list_docs titles");
+
+    const createdDocs = [];
+    for (const title of ["Tasky", "Operations Notes", "Task Tracker"]) {
+      const created = await call("create_doc", {
+        workspaceId: workspace.id,
+        title,
+        content: `${title} body`,
+      });
+      expectTruthy(created?.docId, `create_doc docId for ${title}`);
+      createdDocs.push(created);
+    }
+
+    const expectedTitlesAfterCreate = ["Workspace Home", ...createdDocs.map(doc => doc.title)];
+
+    const trashed = await call("trash_doc", {
+      workspaceId: workspace.id,
+      docId: createdDocs[1].docId,
+    });
+    expectEqual(trashed?.status, "trashed", "trash_doc status");
+    expectEqual(trashed?.inTrash, true, "trash_doc inTrash");
+    expectEqual(trashed?.readBackVerified, true, "trash_doc readBackVerified");
+    await waitForListDocs(
+      workspace.id,
+      result => result?.edges?.some(edge => edge?.node?.id === createdDocs[1].docId && edge?.node?.inTrash === true),
+      "list_docs trashed state sync",
+    );
+    const trashedDoc = await call("read_doc", {
+      workspaceId: workspace.id,
+      docId: createdDocs[1].docId,
+    });
+    expectEqual(trashedDoc?.exists, true, "trash_doc preserves content");
+
+    const restored = await call("restore_doc", {
+      workspaceId: workspace.id,
+      docId: createdDocs[1].docId,
+    });
+    expectEqual(restored?.status, "restored", "restore_doc status");
+    expectEqual(restored?.inTrash, false, "restore_doc inTrash");
+    expectEqual(restored?.readBackVerified, true, "restore_doc readBackVerified");
+    await waitForListDocs(
+      workspace.id,
+      result => result?.edges?.some(edge => edge?.node?.id === createdDocs[1].docId && edge?.node?.inTrash === false),
+      "list_docs restored state sync",
+    );
+
+    await call("create_tag", { workspaceId: workspace.id, tag: "urgent" });
+    await call("add_tag_to_doc", {
+      workspaceId: workspace.id,
+      docId: createdDocs[2].docId,
+      tag: "urgent",
+    });
+
+    const search = await call("search_docs", { workspaceId: workspace.id, query: "Task", limit: 10 });
+    expectEqual(search?.totalCount, 2, "search_docs totalCount");
+    const searchTitles = search?.results?.map(result => result?.title) || [];
+    expectIncludes(searchTitles, "Tasky", "search_docs result titles");
+    expectIncludes(searchTitles, "Task Tracker", "search_docs result titles");
+
+    const exactMatch = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Tasky",
+      matchMode: "exact",
+      limit: 10,
+    });
+    expectEqual(exactMatch?.totalCount, 1, "search_docs exact totalCount");
+    expectEqual(exactMatch?.results?.[0]?.title, "Tasky", "search_docs exact first result");
+
+    const prefixMatch = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Task",
+      matchMode: "prefix",
+      limit: 10,
+    });
+    expectEqual(prefixMatch?.totalCount, 2, "search_docs prefix totalCount");
+
+    const tagFiltered = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Task",
+      tag: "urgent",
+      limit: 10,
+    });
+    expectEqual(tagFiltered?.totalCount, 1, "search_docs tag-filter totalCount");
+    expectEqual(tagFiltered?.results?.[0]?.title, "Task Tracker", "search_docs tag-filter result");
+    expectIncludes(tagFiltered?.results?.[0]?.tags || [], "urgent", "search_docs tag-filter tags");
+
+    const sortedByUpdatedAt = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Task",
+      sortBy: "updatedAt",
+      sortDirection: "desc",
+      limit: 10,
+    });
+    expectEqual(sortedByUpdatedAt?.results?.[0]?.title, "Task Tracker", "search_docs updatedAt sort");
+
+    const firstSearchPage = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Task",
+      limit: 1,
+      offset: 0,
+    });
+    expectEqual(firstSearchPage?.results?.length, 1, "search_docs first page size");
+    expectEqual(firstSearchPage?.limit, 1, "search_docs first page limit");
+    expectEqual(firstSearchPage?.offset, 0, "search_docs first page offset");
+    expectEqual(firstSearchPage?.hasMore, true, "search_docs first page hasMore");
+    expectEqual(firstSearchPage?.truncated, true, "search_docs first page truncated");
+    expectEqual(firstSearchPage?.nextOffset, 1, "search_docs nextOffset");
+
+    const secondSearchPage = await call("search_docs", {
+      workspaceId: workspace.id,
+      query: "Task",
+      limit: 1,
+      offset: 1,
+    });
+    expectEqual(secondSearchPage?.results?.length, 1, "search_docs second page size");
+    expectEqual(secondSearchPage?.hasMore, false, "search_docs second page hasMore");
+    expectEqual(secondSearchPage?.truncated, false, "search_docs second page truncated");
+    expectEqual(secondSearchPage?.nextOffset, null, "search_docs final nextOffset");
+
+    await waitForListDocs(
+      workspace.id,
+      result => {
+        const titles = result?.edges?.map(edge => edge?.node?.title).filter(Boolean) || [];
+        return expectedTitlesAfterCreate.every(title => titles.includes(title)) && titles.length >= expectedTitlesAfterCreate.length;
+      },
+      "list_docs post-create visibility sync",
+    );
+
+    const deletion = await call("delete_doc", {
+      workspaceId: workspace.id,
+      docId: createdDocs[0].docId,
+      confirmDocId: createdDocs[0].docId,
+    });
+    const remainingContent = await call("read_doc", { workspaceId: workspace.id, docId: createdDocs[0].docId });
+    expectEqual(typeof remainingContent?.exists, "boolean", "read_doc existence evidence");
+    const contentAbsent = deletion?.contentAbsenceVerified === true;
+    if (contentAbsent) expectEqual(remainingContent.exists, false, "verified deletion reads absent");
+    if (remainingContent.exists) expectEqual(contentAbsent, false, "readable content is not reported deleted");
+    expectEqual(deletion?.status, contentAbsent ? "deleted" : "partial", "delete_doc status");
+    expectEqual(deletion?.deleted, contentAbsent, "delete_doc deleted");
+    expectEqual(deletion?.metadataRemoved, true, "delete_doc metadataRemoved");
+    expectEqual(deletion?.contentDeleted, contentAbsent, "delete_doc contentDeleted requires verified absence");
+    expectEqual(deletion?.contentAbsenceVerified, contentAbsent, "delete_doc verified absence");
+    if (!contentAbsent) {
+      expectEqual(deletion?.contentDeleteAcknowledged, true, "delete_doc request acknowledgement");
+      expectTruthy(deletion?.warnings?.length > 0, "delete_doc retained-content warning");
+    }
+
+    const listedAfterDelete = await waitForListDocs(
+      workspace.id,
+      result => {
+        const ids = result?.edges?.map(edge => edge?.node?.id).filter(Boolean) || [];
+        return ids.length >= 3
+          && !ids.includes(createdDocs[0].docId)
+          && ids.includes(workspace.firstDocId)
+          && ids.includes(createdDocs[1].docId)
+          && ids.includes(createdDocs[2].docId);
+      },
+      "list_docs post-delete edge sync",
+    );
+    expectEqual(listedAfterDelete?.totalCount, 3, "list_docs totalCount after delete");
+    const listedAfterDeleteIds = listedAfterDelete?.edges?.map(edge => edge?.node?.id) || [];
+    if (listedAfterDeleteIds.includes(createdDocs[0].docId)) {
+      throw new Error(`list_docs deleted doc id: expected deleted id to be absent, got ${JSON.stringify(listedAfterDeleteIds)}`);
+    }
+
+    const lastEdgeCursor = listedAfterDelete?.edges?.[listedAfterDelete.edges.length - 1]?.cursor ?? null;
+    expectEqual(listedAfterDelete?.pageInfo?.endCursor ?? null, lastEdgeCursor, "list_docs endCursor after delete");
+
+    console.log();
+    console.log("=== Document discovery integration test passed ===");
+  } finally {
+    await transport.close();
+  }
+}
+
+main().catch(err => {
+  console.error("FAILED:", err.message);
+  process.exit(1);
+});

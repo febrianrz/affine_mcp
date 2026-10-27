@@ -1,0 +1,199 @@
+import { test, expect } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { signInToAffine } from './sign-in.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+interface TestState {
+  baseUrl: string;
+  email: string;
+  workspaceId: string;
+  workspaceName: string;
+  docId: string;
+  docTitle: string;
+  databaseBlockId: string;
+  columns: Array<{ name: string; type: string; columnId: string | null }>;
+  rows: Array<{ cells: Record<string, unknown>; rowId: string | null }>;
+  error?: string;
+}
+
+interface CellTestState {
+  baseUrl: string;
+  email: string;
+  workspaceId: string;
+  docId: string;
+  databaseBlockId: string;
+  richTextLinks: Array<{ text: string; href: string }>;
+  error?: string;
+}
+
+const STATE_PATH = path.resolve(__dirname, '..', 'test-database-state.json');
+const CELL_STATE_PATH = path.resolve(__dirname, '..', 'test-database-cells-state.json');
+
+let state: TestState;
+let cellState: CellTestState;
+
+test.beforeAll(() => {
+  if (!fs.existsSync(STATE_PATH)) {
+    throw new Error(
+      `State file not found: ${STATE_PATH}\n` +
+      'Run "npm run test:db-create" first to create MCP test data.',
+    );
+  }
+  state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  if (state.error) {
+    throw new Error(`State file contains error from MCP test: ${state.error}`);
+  }
+  if (!state.workspaceId || !state.docId) {
+    throw new Error('State file missing workspaceId or docId');
+  }
+
+  if (!fs.existsSync(CELL_STATE_PATH)) {
+    throw new Error(
+      `State file not found: ${CELL_STATE_PATH}\n` +
+      'Run "npm run test:db-cells" first to create rich-text database test data.',
+    );
+  }
+  cellState = JSON.parse(fs.readFileSync(CELL_STATE_PATH, 'utf8'));
+  if (cellState.error) {
+    throw new Error(`State file contains error from database cell test: ${cellState.error}`);
+  }
+  if (!cellState.workspaceId || !cellState.docId || !cellState.databaseBlockId || !cellState.richTextLinks?.length) {
+    throw new Error('Database cell state is missing IDs or rich-text links');
+  }
+});
+
+const password = process.env.AFFINE_ADMIN_PASSWORD!;
+if (!password) throw new Error('AFFINE_ADMIN_PASSWORD env var required');
+
+test.describe.serial('AFFiNE Database Verification', () => {
+  test('login to AFFiNE', async ({ page, context }) => {
+    test.setTimeout(180_000);
+    const baseUrl = state.baseUrl;
+
+    await signInToAffine(page, { baseUrl, email: state.email, password });
+
+    // Dismiss any onboarding modals/dialogs that may appear
+    for (let i = 0; i < 5; i++) {
+      await page.waitForTimeout(1_000);
+      const dismissBtn = page.locator(
+        'button:has-text("Skip"), button:has-text("Got it"), button:has-text("Close"), ' +
+        'button:has-text("Dismiss"), button:has-text("OK"), button:has-text("Later"), ' +
+        '[data-testid="modal-close"], .modal-close, button[aria-label="Close"]',
+      );
+      if (await dismissBtn.count() > 0) {
+        await dismissBtn.first().click({ timeout: 2_000 }).catch(() => {});
+      } else {
+        break;
+      }
+    }
+
+    // Verify we're logged in — URL should not contain sign-in
+    expect(page.url()).not.toContain('/sign-in');
+
+    // Save auth state for subsequent tests
+    const storageStatePath = path.resolve(__dirname, '..', 'playwright-auth-state.json');
+    await context.storageState({ path: storageStatePath });
+  });
+
+  test('verify database content in document', async ({ browser }) => {
+    // Use saved auth state
+    const storageStatePath = path.resolve(__dirname, '..', 'playwright-auth-state.json');
+    const context = await browser.newContext({
+      storageState: storageStatePath,
+    });
+    const page = await context.newPage();
+
+    try {
+      const baseUrl = state.baseUrl;
+      const docUrl = `${baseUrl}/workspace/${state.workspaceId}/${state.docId}`;
+
+      // Navigate directly to the document
+      await page.goto(docUrl);
+      await page.waitForLoadState('domcontentloaded');
+
+      // If redirected to sign-in, fail early with useful message
+      if (page.url().includes('/sign-in')) {
+        throw new Error('Redirected to sign-in — login test did not persist auth state');
+      }
+
+      // Dismiss any onboarding/update modals
+      for (let i = 0; i < 3; i++) {
+        await page.waitForTimeout(1_000);
+        const dismissBtn = page.locator(
+          'button:has-text("Skip"), button:has-text("Got it"), button:has-text("Close"), ' +
+          'button:has-text("Dismiss"), button:has-text("OK"), button:has-text("Later"), ' +
+          '[data-testid="modal-close"], .modal-close, button[aria-label="Close"]',
+        );
+        if (await dismissBtn.count() > 0) {
+          await dismissBtn.first().click({ timeout: 2_000 }).catch(() => {});
+        } else {
+          break;
+        }
+      }
+
+      // Wait for the page content to render (AFFiNE SPA needs time)
+      await page.waitForTimeout(5_000);
+
+      // Verify database block is visible
+      const databaseBlock = page.locator(
+        'affine-database, [data-block-flavour="affine:database"], ' +
+        '.affine-database-block-container, [class*="database"]',
+      );
+      await expect(databaseBlock.first()).toBeVisible({ timeout: 30_000 });
+
+      // Verify column headers
+      const columnNames = ['Title', 'Status'];
+      for (const colName of columnNames) {
+        const colHeader = page.getByText(colName, { exact: true });
+        await expect(colHeader.first()).toBeVisible({ timeout: 10_000 });
+      }
+
+      // Verify row content — check that each row's title value appears
+      const rowNames = ['Build feature', 'Write tests', 'Deploy release'];
+      for (const name of rowNames) {
+        const rowCell = page.getByText(name, { exact: true });
+        await expect(rowCell.first()).toBeVisible({ timeout: 10_000 });
+      }
+
+      // Verify a select value is present
+      const selectValue = page.getByText('Active', { exact: true });
+      await expect(selectValue.first()).toBeVisible({ timeout: 10_000 });
+    } finally {
+      await context.close();
+    }
+  });
+
+  test('verify rich-text database links in the AFFiNE editor', async ({ browser }) => {
+    const storageStatePath = path.resolve(__dirname, '..', 'playwright-auth-state.json');
+    const context = await browser.newContext({ storageState: storageStatePath });
+    const page = await context.newPage();
+
+    try {
+      await page.goto(`${cellState.baseUrl}/workspace/${cellState.workspaceId}/${cellState.docId}`);
+      await page.waitForLoadState('domcontentloaded');
+
+      if (page.url().includes('/sign-in')) {
+        throw new Error('Redirected to sign-in — login test did not persist auth state');
+      }
+
+      await page.waitForTimeout(5_000);
+      const databaseBlock = page.locator(
+        'affine-database, [data-block-flavour="affine:database"], ' +
+        '.affine-database-block-container, [class*="database"]',
+      );
+      await expect(databaseBlock.first()).toBeVisible({ timeout: 30_000 });
+
+      for (const expectedLink of cellState.richTextLinks) {
+        const link = page.locator(`a[href="${expectedLink.href}"]`).filter({ hasText: expectedLink.text }).first();
+        await expect(link).toBeVisible({ timeout: 15_000 });
+        await expect(link).toHaveAttribute('href', expectedLink.href);
+      }
+    } finally {
+      await context.close();
+    }
+  });
+});

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - main
+      - fix/**
+      - feat/**
+      - chore/**
+
+jobs:
+  validate:
+    name: Validate on Node.js ${{ matrix.node-version }}
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'develop' || (github.base_ref == 'main' && startsWith(github.head_ref, 'release/')) }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24, 26]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run CI quality gates
+        run: npm run ci
+
+      - name: Smoke test packed package
+        run: |
+          ARTIFACT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$ARTIFACT_DIR"' EXIT
+          PACK_RESULT="$ARTIFACT_DIR/npm-pack.json"
+          npm pack --json --pack-destination "$ARTIFACT_DIR" > "$PACK_RESULT"
+          TARBALL_NAME="$(node -e 'const fs = require("node:fs"); const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (result.length !== 1 || !result[0].filename) process.exit(1); process.stdout.write(result[0].filename);' "$PACK_RESULT")"
+          npm run test:package-smoke -- --tarball "$ARTIFACT_DIR/$TARBALL_NAME"

@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+#
+# E2E test orchestration:
+#   1. Start AFFiNE via Docker Compose
+#   2. Wait for health + acquire credentials
+#   3. Build the MCP server
+#   4. Run the manifest-defined release integration suite
+#   5. Run Playwright UI verification (all scenarios)
+#   6. Tear down Docker (on exit)
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DOCKER_DIR="$PROJECT_DIR/docker"
+COMPOSE_FILE="$DOCKER_DIR/docker-compose.yml"
+
+find_free_port() {
+  node -e 'const net=require("net");const server=net.createServer();server.listen(0,"127.0.0.1",()=>{const {port}=server.address();console.log(port);server.close();});'
+}
+
+# --- Configuration ---
+export PORT="${PORT:-$(find_free_port)}"
+export AFFINE_BASE_URL="${AFFINE_BASE_URL:-http://localhost:${PORT}}"
+export AFFINE_HEALTH_MAX_RETRIES="${AFFINE_HEALTH_MAX_RETRIES:-90}"
+export AFFINE_HEALTH_INTERVAL_MS="${AFFINE_HEALTH_INTERVAL_MS:-5000}"
+export AFFINE_HEALTH_REQUEST_TIMEOUT_MS="${AFFINE_HEALTH_REQUEST_TIMEOUT_MS:-3000}"
+export AFFINE_CREDENTIAL_ACQUIRE_RETRIES="${AFFINE_CREDENTIAL_ACQUIRE_RETRIES:-3}"
+export AFFINE_CREDENTIAL_RETRY_DELAY_SECONDS="${AFFINE_CREDENTIAL_RETRY_DELAY_SECONDS:-5}"
+export AFFINE_AUTH_READY_MAX_RETRIES="${AFFINE_AUTH_READY_MAX_RETRIES:-30}"
+export AFFINE_AUTH_READY_INTERVAL_SECONDS="${AFFINE_AUTH_READY_INTERVAL_SECONDS:-3}"
+export AFFINE_DOCKER_START_RETRIES="${AFFINE_DOCKER_START_RETRIES:-3}"
+export AFFINE_DOCKER_RETRY_DELAY_SECONDS="${AFFINE_DOCKER_RETRY_DELAY_SECONDS:-5}"
+
+# Fail before Docker setup or authentication if the selected target is unsafe.
+AFFINE_TEST_RUN_ID="$(node "$SCRIPT_DIR/assert-destructive-test-target.mjs" --print-run-id)"
+compose_run_id="$(printf '%s' "$AFFINE_TEST_RUN_ID" | tr '[:upper:].' '[:lower:]_')"
+export COMPOSE_PROJECT_NAME="affine_mcp_e2e_${compose_run_id}"
+AFFINE_TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/affine-mcp-e2e.XXXXXX")"
+export AFFINE_TEST_RUN_ID AFFINE_TEST_TMP_DIR
+export XDG_CONFIG_HOME="$AFFINE_TEST_TMP_DIR/xdg"
+
+cleanup_test_files() {
+  if [[ "${AFFINE_TEST_ENV_FILE_OWNED:-0}" == "1" && -n "${AFFINE_TEST_ENV_FILE:-}" ]]; then
+    rm -f -- "$AFFINE_TEST_ENV_FILE"
+  fi
+  rm -rf -- "$AFFINE_TEST_TMP_DIR"
+}
+trap cleanup_test_files EXIT
+
+# Generate random credentials in a private per-run env file.
+echo "=== Generating test credentials ==="
+# shellcheck source=tests/generate-test-env.sh
+. "$SCRIPT_DIR/generate-test-env.sh"
+
+compose() {
+  docker compose --env-file "$AFFINE_TEST_ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+# --- Cleanup on exit ---
+cleanup() {
+  echo ""
+  echo "=== Tearing down Docker containers ==="
+  compose down -v --remove-orphans 2>/dev/null || true
+  cleanup_test_files
+}
+trap cleanup EXIT
+
+compose_container_id() {
+  compose ps -aq "$1" 2>/dev/null || true
+}
+
+docker_diagnostics() {
+  echo ""
+  echo "=== Docker diagnostics (on failure) ==="
+  compose ps || true
+  echo ""
+  compose logs --no-color --tail=200 affine affine_gateway affine_migration postgres redis || true
+}
+
+docker_compose_with_retry() {
+  local description="$1"
+  shift
+  local attempt
+  local output_file
+  output_file="$(mktemp "$AFFINE_TEST_TMP_DIR/docker-compose.XXXXXX")"
+
+  for ((attempt = 1; attempt <= AFFINE_DOCKER_START_RETRIES; attempt++)); do
+    if compose "$@" >"$output_file" 2>&1; then
+      cat "$output_file"
+      rm -f "$output_file"
+      return 0
+    fi
+
+    echo "[e2e] ${description} failed (attempt ${attempt}/${AFFINE_DOCKER_START_RETRIES})"
+    cat "$output_file"
+    docker_diagnostics
+    compose down -v --remove-orphans 2>/dev/null || true
+
+    if ((attempt < AFFINE_DOCKER_START_RETRIES)); then
+      echo "[e2e] Retrying ${description} in ${AFFINE_DOCKER_RETRY_DELAY_SECONDS}s..."
+      sleep "$AFFINE_DOCKER_RETRY_DELAY_SECONDS"
+    fi
+  done
+
+  rm -f "$output_file"
+  return 1
+}
+
+wait_for_container_health() {
+  local service_name="$1"
+  local max_attempts="${2:-30}"
+  local sleep_seconds="${3:-2}"
+  local attempt
+  local container_id
+  local status
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    container_id="$(compose_container_id "$service_name")"
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+    if [[ "$status" == "healthy" || "$status" == "running" ]]; then
+      echo "[e2e] Service ${service_name} ready after ${attempt} attempt(s) (status=${status})"
+      return 0
+    fi
+
+    echo "[e2e] Waiting for ${service_name}: attempt ${attempt}/${max_attempts} (status=${status:-missing})"
+    sleep "$sleep_seconds"
+  done
+
+  echo "[e2e] ERROR: service ${service_name} did not become ready"
+  docker_diagnostics
+  return 1
+}
+
+wait_for_container_running() {
+  local service_name="$1"
+  local max_attempts="${2:-30}"
+  local sleep_seconds="${3:-2}"
+  local attempt
+  local container_id
+  local status
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    container_id="$(compose_container_id "$service_name")"
+    status="$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+    if [[ "$status" == "running" ]]; then
+      echo "[e2e] Service ${service_name} container running after ${attempt} attempt(s)"
+      return 0
+    fi
+
+    echo "[e2e] Waiting for ${service_name} container: attempt ${attempt}/${max_attempts} (status=${status:-missing})"
+    sleep "$sleep_seconds"
+  done
+
+  echo "[e2e] ERROR: service ${service_name} container did not reach running state"
+  docker_diagnostics
+  return 1
+}
+
+wait_for_container_exit_zero() {
+  local service_name="$1"
+  local max_attempts="${2:-30}"
+  local sleep_seconds="${3:-2}"
+  local attempt
+  local container_id
+  local status
+  local exit_code
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    container_id="$(compose_container_id "$service_name")"
+    status="$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+    exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$container_id" 2>/dev/null || true)"
+
+    if [[ "$status" == "exited" && "$exit_code" == "0" ]]; then
+      echo "[e2e] Service ${service_name} completed successfully after ${attempt} attempt(s)"
+      return 0
+    fi
+
+    echo "[e2e] Waiting for ${service_name} completion: attempt ${attempt}/${max_attempts} (status=${status:-missing}, exit=${exit_code:-missing})"
+    sleep "$sleep_seconds"
+  done
+
+  echo "[e2e] ERROR: service ${service_name} did not complete successfully"
+  docker_diagnostics
+  return 1
+}
+
+start_docker_stack() {
+  docker_compose_with_retry "base service startup" up -d postgres redis
+  wait_for_container_health postgres 30 2
+  wait_for_container_health redis 30 2
+
+  docker_compose_with_retry "migration startup" up -d --no-deps affine_migration
+  wait_for_container_exit_zero affine_migration 45 2
+
+  docker_compose_with_retry "app startup" up -d --no-deps affine affine_gateway
+  wait_for_container_running affine 45 2
+}
+
+acquire_credentials_with_retry() {
+  local attempt
+  local exit_code=1
+
+  for ((attempt = 1; attempt <= AFFINE_CREDENTIAL_ACQUIRE_RETRIES; attempt++)); do
+    if node "$SCRIPT_DIR/acquire-credentials.mjs"; then
+      return 0
+    else
+      exit_code=$?
+    fi
+    echo "[e2e] Credential acquisition failed (attempt ${attempt}/${AFFINE_CREDENTIAL_ACQUIRE_RETRIES}, exit ${exit_code})"
+    docker_diagnostics
+
+    if ((attempt < AFFINE_CREDENTIAL_ACQUIRE_RETRIES)); then
+      echo "[e2e] Retrying credential acquisition in ${AFFINE_CREDENTIAL_RETRY_DELAY_SECONDS}s..."
+      sleep "$AFFINE_CREDENTIAL_RETRY_DELAY_SECONDS"
+    fi
+  done
+
+  return "$exit_code"
+}
+
+wait_for_auth_ready() {
+  local attempt
+  local setup_status
+  local sign_in_status
+  local base_url="${AFFINE_BASE_URL%/}"
+  local payload
+  local setup_response="$AFFINE_TEST_TMP_DIR/setup-response.txt"
+  local sign_in_response="$AFFINE_TEST_TMP_DIR/sign-in-response.txt"
+  payload="$(node -e 'process.stdout.write(JSON.stringify({email:process.env.AFFINE_ADMIN_EMAIL,password:process.env.AFFINE_ADMIN_PASSWORD}))')"
+
+  for ((attempt = 1; attempt <= AFFINE_AUTH_READY_MAX_RETRIES; attempt++)); do
+    setup_status="$(
+      curl -sS -o "$setup_response" -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST "$base_url/api/setup/create-admin-user" \
+        -d "$payload" || true
+    )"
+
+    sign_in_status="$(
+      curl -sS -o "$sign_in_response" -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST "$base_url/api/auth/sign-in" \
+        -d "$payload" || true
+    )"
+
+    if [[ "$sign_in_status" == "200" ]]; then
+      echo "[e2e] AFFiNE auth readiness confirmed after ${attempt} attempt(s) (setup=${setup_status}, sign-in=${sign_in_status})"
+      return 0
+    fi
+
+    echo "[e2e] Auth readiness attempt ${attempt}/${AFFINE_AUTH_READY_MAX_RETRIES}: setup=${setup_status}, sign-in=${sign_in_status}"
+    if ((attempt < AFFINE_AUTH_READY_MAX_RETRIES)); then
+      sleep "$AFFINE_AUTH_READY_INTERVAL_SECONDS"
+    fi
+  done
+
+  echo "[e2e] ERROR: AFFiNE sign-in endpoint did not become ready in time"
+  if [[ -s "$sign_in_response" ]]; then
+    echo "[e2e] Last sign-in response body (first 500 bytes):"
+    head -c 500 "$sign_in_response"
+    echo ""
+  fi
+  docker_diagnostics
+  return 1
+}
+
+ensure_affine_ui_ready() {
+  local base_url="${AFFINE_BASE_URL%/}"
+
+  if curl -fsS --max-time "$((AFFINE_HEALTH_REQUEST_TIMEOUT_MS / 1000))" "$base_url/" >/dev/null 2>&1; then
+    echo "[e2e] AFFiNE UI already reachable for Playwright"
+    return 0
+  fi
+
+  echo "[e2e] AFFiNE UI is not reachable before Playwright; attempting service recovery..."
+  docker_diagnostics
+
+  compose up -d --no-deps affine affine_gateway
+  acquire_credentials_with_retry
+  wait_for_auth_ready
+}
+
+# --- Step 0: Clean up any stale containers from previous runs ---
+compose down -v --remove-orphans 2>/dev/null || true
+
+# --- Step 1: Start Docker ---
+echo "=== Starting AFFiNE via Docker Compose ==="
+start_docker_stack
+
+# --- Step 2: Wait for health + verify credentials ---
+echo ""
+echo "=== Waiting for AFFiNE to become healthy ==="
+acquire_credentials_with_retry
+echo ""
+echo "=== Verifying AFFiNE auth readiness ==="
+wait_for_auth_ready
+
+# Repeated test logins must not exhaust the disposable backend's rate limit.
+echo "=== Configuring isolated AFFiNE test instance ==="
+node "$SCRIPT_DIR/configure-test-instance.mjs"
+
+# --- Step 3: Build MCP server ---
+echo ""
+echo "=== Building MCP server ==="
+cd "$PROJECT_DIR"
+npm run build
+
+# --- Step 4: Run the manifest-defined release integration suite ---
+echo ""
+echo "=== Running release integration suite ==="
+node "$PROJECT_DIR/scripts/run-test-suite.mjs" e2e
+
+# --- Step 5: Run Playwright verification ---
+echo ""
+echo "=== Running Playwright UI verification ==="
+ensure_affine_ui_ready
+npx playwright test --config "$SCRIPT_DIR/playwright/playwright.config.ts"
+
+echo ""
+echo "=== E2E test pipeline completed successfully ==="

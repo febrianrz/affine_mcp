@@ -1,0 +1,708 @@
+#!/usr/bin/env node
+import "./require-destructive-test-safety.mjs";
+
+import assert from "node:assert/strict";
+
+import * as Y from "yjs";
+
+import { deleteDoc } from "../dist/ws.js";
+import { registerBlobTools } from "../dist/tools/blobStorage.js";
+import { registerCommentTools } from "../dist/tools/comments.js";
+import {
+  createAcknowledgedDeletedDocTracker,
+  deleteDocFromWorkspace,
+  isRetryableTrashStateError,
+  setDocTrashState,
+} from "../dist/tools/docs.js";
+import { registerNotificationTools } from "../dist/tools/notifications.js";
+import { registerWorkspaceTools } from "../dist/tools/workspaces.js";
+
+function parseToolResult(result) {
+  if (result?.structuredContent) {
+    return result.structuredContent;
+  }
+  const raw = result?.content?.[0]?.text;
+  return raw ? JSON.parse(raw) : null;
+}
+
+function assertStableFailure(result, code, status = "failed", retryable = false) {
+  const payload = parseToolResult(result);
+  assert.equal(result.isError, true);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.status, status);
+  assert.equal(payload.code, code);
+  assert.equal(payload.retryable, retryable);
+  assert.equal("message" in payload, false);
+  assert.equal("success" in payload, false);
+  return payload;
+}
+
+function createWorkspaceDoc(docId, includeMetadata) {
+  const doc = new Y.Doc();
+  const pages = new Y.Array();
+  if (includeMetadata) {
+    const page = new Y.Map();
+    page.set("id", docId);
+    page.set("title", "Deletion Test");
+    pages.push([page]);
+  }
+  doc.getMap("meta").set("pages", pages);
+  return doc;
+}
+
+function encodedDoc() {
+  const doc = new Y.Doc();
+  doc.getMap("meta").set("id", "content");
+  return Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64");
+}
+
+class FakeWorkspaceSocket {
+  constructor({
+    workspaceId = "workspace-1",
+    docId = "doc-1",
+    metadataExists = true,
+    contentExists = true,
+    deleteMode = "void-success",
+    pushMode = "success",
+    staleWorkspaceReadsAfterPush = 0,
+    missingContentAck = null,
+    contentReadTimeouts = 0,
+  } = {}) {
+    this.workspaceId = workspaceId;
+    this.docId = docId;
+    this.workspaceDoc = createWorkspaceDoc(docId, metadataExists);
+    this.contentExists = contentExists;
+    this.deleteMode = deleteMode;
+    this.pushMode = pushMode;
+    this.staleWorkspaceReadsAfterPush = staleWorkspaceReadsAfterPush;
+    this.staleWorkspaceUpdate = null;
+    this.missingContentAck = missingContentAck;
+    this.contentReadTimeouts = contentReadTimeouts;
+    this.events = [];
+    this.listeners = new Map();
+  }
+
+  emit(event, payload, ack) {
+    this.events.push({ event, payload });
+    queueMicrotask(() => {
+      if (event === "space:load-doc") {
+        if (payload.docId === this.workspaceId) {
+          if (this.staleWorkspaceReadsAfterPush > 0 && this.staleWorkspaceUpdate) {
+            this.staleWorkspaceReadsAfterPush -= 1;
+            ack?.({ data: { missing: this.staleWorkspaceUpdate, timestamp: 1 } });
+            return;
+          }
+          ack?.({
+            data: {
+              missing: Buffer.from(Y.encodeStateAsUpdate(this.workspaceDoc)).toString("base64"),
+              timestamp: 1,
+            },
+          });
+          return;
+        }
+        if (this.contentReadTimeouts > 0) {
+          this.contentReadTimeouts -= 1;
+          return;
+        }
+        if (payload.docId === this.docId && this.contentExists) {
+          ack?.({ data: { missing: encodedDoc(), timestamp: 1 } });
+          return;
+        }
+        ack?.(this.missingContentAck ?? { error: { name: "DOC_NOT_FOUND", message: "Document not found" } });
+        return;
+      }
+
+      if (event === "space:push-doc-update") {
+        if (this.pushMode === "error") {
+          ack?.({ error: { name: "SYNC_FAILED", message: "workspace metadata sync failed" } });
+          return;
+        }
+        if (payload.docId === this.workspaceId) {
+          this.staleWorkspaceUpdate = Buffer.from(Y.encodeStateAsUpdate(this.workspaceDoc)).toString("base64");
+          Y.applyUpdate(this.workspaceDoc, Buffer.from(payload.update, "base64"));
+        }
+        ack?.({ data: { timestamp: 2 } });
+        return;
+      }
+
+      if (event === "space:delete-doc") {
+        if (this.deleteMode === "error") {
+          ack?.({ error: { name: "FORBIDDEN", message: "Doc.Delete permission denied" } });
+          return;
+        }
+        if (this.deleteMode === "stall") {
+          return;
+        }
+        if (this.deleteMode === "negative-ack") {
+          ack?.({ data: { deleted: false } });
+          return;
+        }
+        if (this.deleteMode === "server-success-ack") {
+          ack?.({ data: { success: true } });
+          return;
+        }
+        if (this.deleteMode === "ack-then-disconnect") {
+          ack?.({ data: { success: true } });
+          this.listeners.get("disconnect")?.();
+          return;
+        }
+        if (this.deleteMode === "server-negative-ack") {
+          ack?.({ data: { success: false } });
+          return;
+        }
+        if (this.deleteMode === "empty-ack-still-present") {
+          ack?.({});
+          return;
+        }
+        this.contentExists = false;
+        if (this.deleteMode === "ack-success") {
+          ack?.({ data: { deleted: true } });
+        } else if (this.deleteMode === "empty-ack-success") {
+          ack?.({});
+        }
+      }
+    });
+    return this;
+  }
+
+  once(event, listener) {
+    this.listeners.set(event, listener);
+    return this;
+  }
+
+  off(event, listener) {
+    if (this.listeners.get(event) === listener) {
+      this.listeners.delete(event);
+    }
+    return this;
+  }
+
+  pageIds() {
+    const pages = this.workspaceDoc.getMap("meta").get("pages");
+    return pages instanceof Y.Array ? pages.toArray().map(page => page.get("id")) : [];
+  }
+
+  page() {
+    const pages = this.workspaceDoc.getMap("meta").get("pages");
+    if (!(pages instanceof Y.Array)) return null;
+    return pages.toArray().find(page => page.get("id") === this.docId) ?? null;
+  }
+}
+
+class ToolRegistry {
+  tools = new Map();
+
+  registerTool(name, _definition, handler) {
+    this.tools.set(name, handler);
+  }
+}
+
+function testAcknowledgedDeleteTrackerBounds() {
+  let currentTime = 0;
+  const tracker = createAcknowledgedDeletedDocTracker({
+    ttlMs: 100,
+    maxEntries: 2,
+    now: () => currentTime,
+  });
+
+  tracker.remember("workspace-1", "doc-1");
+  currentTime = 50;
+  tracker.remember("workspace-1", "doc-2");
+  assert.deepEqual([...tracker.idsFor("workspace-1")], ["doc-1", "doc-2"]);
+
+  currentTime = 75;
+  tracker.remember("workspace-2", "doc-3");
+  assert.deepEqual([...tracker.idsFor("workspace-1")], ["doc-2"]);
+  assert.deepEqual([...tracker.idsFor("workspace-2")], ["doc-3"]);
+
+  currentTime = 151;
+  assert.deepEqual([...tracker.idsFor("workspace-1")], []);
+  assert.deepEqual([...tracker.idsFor("workspace-2")], ["doc-3"]);
+
+  tracker.forget("workspace-2", "doc-3");
+  assert.deepEqual([...tracker.idsFor("workspace-2")], []);
+}
+
+async function testDeleteDocProtocol() {
+  const acknowledgedSocket = new FakeWorkspaceSocket({ deleteMode: "ack-success" });
+  const acknowledged = await deleteDoc(acknowledgedSocket, "workspace-1", "doc-1", {
+    timeoutMs: 100,
+    verificationIntervalMs: 5,
+  });
+  assert.deepEqual(acknowledged, { acknowledged: true, verifiedAbsent: true });
+  assert.ok(acknowledgedSocket.events.some(entry => entry.event === "space:load-doc"));
+
+  const slowVerificationSocket = new FakeWorkspaceSocket({ deleteMode: "ack-success", contentReadTimeouts: 1 });
+  assert.deepEqual(
+    await deleteDoc(slowVerificationSocket, "workspace-1", "doc-1", { timeoutMs: 100, verificationIntervalMs: 5 }),
+    { acknowledged: true, verifiedAbsent: true },
+    "a timed-out verification read after acknowledgement is retried until absence is confirmed",
+  );
+  assert.equal(slowVerificationSocket.events.filter(entry => entry.event === "space:load-doc").length, 2);
+
+  const timedOutVerificationSocket = new FakeWorkspaceSocket({ deleteMode: "ack-success", contentReadTimeouts: 100 });
+  assert.deepEqual(
+    await deleteDoc(timedOutVerificationSocket, "workspace-1", "doc-1", { timeoutMs: 60, verificationIntervalMs: 5 }),
+    { acknowledged: true, verifiedAbsent: false },
+    "repeated verification timeouts preserve acknowledgement at the operation deadline",
+  );
+  assert.ok(timedOutVerificationSocket.events.filter(entry => entry.event === "space:load-doc").length >= 2);
+
+  const verificationDeniedSocket = new FakeWorkspaceSocket({
+    deleteMode: "ack-success",
+    missingContentAck: { error: { name: "FORBIDDEN", message: "Doc.Read permission denied" } },
+  });
+  assert.deepEqual(
+    await deleteDoc(verificationDeniedSocket, "workspace-1", "doc-1", { timeoutMs: 100, verificationIntervalMs: 5 }),
+    { acknowledged: true, verifiedAbsent: false },
+    "non-timeout verification errors still return unverified immediately after acknowledgement",
+  );
+  assert.equal(verificationDeniedSocket.events.filter(entry => entry.event === "space:load-doc").length, 1);
+
+  const serverAcknowledgedSocket = new FakeWorkspaceSocket({ deleteMode: "server-success-ack" });
+  const serverAcknowledged = await deleteDoc(serverAcknowledgedSocket, "workspace-1", "doc-1", {
+    timeoutMs: 100,
+    verificationIntervalMs: 5,
+  });
+  assert.deepEqual(serverAcknowledged, { acknowledged: true, verifiedAbsent: false });
+  assert.equal(serverAcknowledgedSocket.contentExists, true);
+  assert.ok(serverAcknowledgedSocket.events.some(entry => entry.event === "space:load-doc"));
+
+  const disconnectedSocket = new FakeWorkspaceSocket({ deleteMode: "ack-then-disconnect" });
+  assert.deepEqual(
+    await deleteDoc(disconnectedSocket, "workspace-1", "doc-1", { timeoutMs: 100, verificationIntervalMs: 5 }),
+    { acknowledged: true, verifiedAbsent: false },
+  );
+
+  const voidSuccessSocket = new FakeWorkspaceSocket({ deleteMode: "void-success" });
+  const verified = await deleteDoc(voidSuccessSocket, "workspace-1", "doc-1", {
+    timeoutMs: 100,
+    verificationIntervalMs: 5,
+  });
+  assert.deepEqual(verified, { acknowledged: false, verifiedAbsent: true });
+  assert.deepEqual(voidSuccessSocket.events[0], {
+    event: "space:delete-doc",
+    payload: { spaceType: "workspace", spaceId: "workspace-1", docId: "doc-1" },
+  });
+
+  const emptyAcknowledgementSocket = new FakeWorkspaceSocket({ deleteMode: "empty-ack-success" });
+  const emptyAcknowledgement = await deleteDoc(emptyAcknowledgementSocket, "workspace-1", "doc-1", {
+    timeoutMs: 100,
+    verificationIntervalMs: 5,
+  });
+  assert.deepEqual(emptyAcknowledgement, { acknowledged: false, verifiedAbsent: true });
+
+  const negativeAcknowledgementSocket = new FakeWorkspaceSocket({ deleteMode: "negative-ack" });
+  await assert.rejects(
+    deleteDoc(negativeAcknowledgementSocket, "workspace-1", "doc-1", {
+      timeoutMs: 100,
+      verificationIntervalMs: 5,
+    }),
+    /did not confirm document deletion/,
+  );
+
+  const serverNegativeAcknowledgementSocket = new FakeWorkspaceSocket({ deleteMode: "server-negative-ack" });
+  await assert.rejects(
+    deleteDoc(serverNegativeAcknowledgementSocket, "workspace-1", "doc-1", {
+      timeoutMs: 100,
+      verificationIntervalMs: 5,
+    }),
+    /did not confirm document deletion/,
+  );
+
+  const emptyUnverifiedSocket = new FakeWorkspaceSocket({ deleteMode: "empty-ack-still-present" });
+  await assert.rejects(
+    deleteDoc(emptyUnverifiedSocket, "workspace-1", "doc-1", {
+      timeoutMs: 30,
+      verificationIntervalMs: 5,
+    }),
+    /deletion could not be verified within 30ms/,
+  );
+
+  const deniedSocket = new FakeWorkspaceSocket({ deleteMode: "error" });
+  await assert.rejects(
+    deleteDoc(deniedSocket, "workspace-1", "doc-1", {
+      timeoutMs: 100,
+      verificationIntervalMs: 5,
+    }),
+    /Doc\.Delete permission denied/,
+  );
+
+  const stalledSocket = new FakeWorkspaceSocket({ deleteMode: "stall" });
+  await assert.rejects(
+    deleteDoc(stalledSocket, "workspace-1", "doc-1", {
+      timeoutMs: 30,
+      verificationIntervalMs: 5,
+    }),
+    /deletion could not be verified within 30ms/,
+  );
+}
+
+async function testDocumentReceipts() {
+  const deletedSocket = new FakeWorkspaceSocket({ deleteMode: "void-success" });
+  const deleted = parseToolResult(
+    await deleteDocFromWorkspace(deletedSocket, "workspace-1", "doc-1"),
+  );
+  assert.equal(deleted.ok, true);
+  assert.equal(deleted.status, "deleted");
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.metadataExisted, true);
+  assert.equal(deleted.metadataRemoved, true);
+  assert.equal(deleted.contentExisted, true);
+  assert.equal(deleted.contentDeleted, true);
+  assert.equal(deleted.contentDeleteAcknowledged, false);
+  assert.equal(deleted.contentAbsenceVerified, true);
+  assert.deepEqual(deletedSocket.pageIds(), []);
+
+  const retainedSocket = new FakeWorkspaceSocket({ deleteMode: "server-success-ack" });
+  const retained = parseToolResult(
+    await deleteDocFromWorkspace(retainedSocket, "workspace-1", "doc-1"),
+  );
+  assert.equal(retained.ok, true);
+  assert.equal(retained.status, "partial");
+  assert.equal(retained.deleted, false);
+  assert.equal(retained.metadataRemoved, true);
+  assert.equal(retained.contentDeleted, false);
+  assert.equal(retained.contentDeleteAcknowledged, true);
+  assert.equal(retained.contentAbsenceVerified, false);
+  assert.match(retained.warnings.join(" "), /remain readable and continue syncing/);
+  assert.equal(retainedSocket.contentExists, true);
+  assert.deepEqual(retainedSocket.pageIds(), []);
+
+  const disconnectedSocket = new FakeWorkspaceSocket({ deleteMode: "ack-then-disconnect" });
+  const disconnected = parseToolResult(await deleteDocFromWorkspace(disconnectedSocket, "workspace-1", "doc-1"));
+  assert.equal(disconnected.status, "partial");
+  assert.equal(disconnected.contentDeleted, false);
+  assert.equal(disconnected.contentDeleteAcknowledged, true);
+  assert.equal(disconnected.contentAbsenceVerified, false);
+  assert.ok(disconnected.warnings.length > 0);
+
+  for (const missingContentAck of [{}, { data: { timestamp: 1 } }]) {
+    const unconfirmedSocket = new FakeWorkspaceSocket({ contentExists: false, missingContentAck });
+    await assert.rejects(
+      deleteDocFromWorkspace(unconfirmedSocket, "workspace-1", "doc-1"),
+      error => error.code === "doc_content_state_unconfirmed",
+    );
+    assert.deepEqual(unconfirmedSocket.pageIds(), ["doc-1"]);
+    assert.equal(unconfirmedSocket.events.some(entry => entry.event === "space:delete-doc" || entry.event === "space:push-doc-update"), false);
+  }
+
+  const partialSocket = new FakeWorkspaceSocket({ deleteMode: "error" });
+  const partialResult = await deleteDocFromWorkspace(partialSocket, "workspace-1", "doc-1");
+  const partial = assertStableFailure(partialResult, "doc_content_delete_failed", "partial");
+  assert.equal(partial.deleted, false);
+  assert.equal(partial.metadataRemoved, true);
+  assert.equal(partial.contentDeleted, false);
+  assert.match(partial.error, /Doc\.Delete permission denied/);
+  assert.deepEqual(partialSocket.pageIds(), []);
+
+  const metadataFailureSocket = new FakeWorkspaceSocket({ pushMode: "error" });
+  const metadataFailureResult = await deleteDocFromWorkspace(metadataFailureSocket, "workspace-1", "doc-1");
+  const metadataFailure = assertStableFailure(metadataFailureResult, "doc_metadata_delete_failed");
+  assert.equal(metadataFailure.metadataRemoved, false);
+  assert.equal(metadataFailure.contentDeleted, false);
+  assert.match(metadataFailure.error, /workspace metadata sync failed/);
+  assert.equal(metadataFailureSocket.events.some(entry => entry.event === "space:delete-doc"), false);
+  assert.deepEqual(metadataFailureSocket.pageIds(), ["doc-1"]);
+
+  const alreadyAbsentSocket = new FakeWorkspaceSocket({
+    metadataExists: false,
+    contentExists: false,
+  });
+  const alreadyAbsent = parseToolResult(
+    await deleteDocFromWorkspace(alreadyAbsentSocket, "workspace-1", "doc-1"),
+  );
+  assert.equal(alreadyAbsent.ok, true);
+  assert.equal(alreadyAbsent.status, "already_absent");
+  assert.equal(alreadyAbsent.deleted, false);
+  assert.equal(alreadyAbsent.alreadyAbsent, true);
+  assert.equal(alreadyAbsent.contentAbsenceVerified, true);
+  assert.equal(alreadyAbsentSocket.events.some(entry => entry.event === "space:delete-doc"), false);
+
+  const metadataOnlySocket = new FakeWorkspaceSocket({ contentExists: false });
+  const metadataOnly = parseToolResult(
+    await deleteDocFromWorkspace(metadataOnlySocket, "workspace-1", "doc-1"),
+  );
+  assert.equal(metadataOnly.status, "deleted");
+  assert.equal(metadataOnly.metadataRemoved, true);
+  assert.equal(metadataOnly.contentDeleted, false);
+  assert.equal(metadataOnly.contentAbsenceVerified, true);
+
+  await assert.rejects(
+    deleteDocFromWorkspace(new FakeWorkspaceSocket(), "workspace-1", "workspace-1"),
+    /cannot delete the workspace metadata document/,
+  );
+}
+
+async function testDocumentTrashReceipts() {
+  const socket = new FakeWorkspaceSocket();
+
+  const trashed = parseToolResult(
+    await setDocTrashState(socket, "workspace-1", "doc-1", true),
+  );
+  assert.equal(trashed.ok, true);
+  assert.equal(trashed.status, "trashed");
+  assert.equal(trashed.changed, true);
+  assert.equal(trashed.previouslyInTrash, false);
+  assert.equal(trashed.inTrash, true);
+  assert.equal(typeof trashed.trashDate, "number");
+  assert.equal(trashed.readBackVerified, true);
+  assert.equal(socket.page().get("trash"), true);
+  assert.equal(socket.page().has("trashDate"), true);
+
+  const trashedAgain = parseToolResult(
+    await setDocTrashState(socket, "workspace-1", "doc-1", true),
+  );
+  assert.equal(trashedAgain.status, "already_trashed");
+  assert.equal(trashedAgain.changed, false);
+  assert.equal(
+    socket.events.filter(event => event.event === "space:push-doc-update").length,
+    1,
+    "an idempotent trash retry must not push another workspace update",
+  );
+
+  const restored = parseToolResult(
+    await setDocTrashState(socket, "workspace-1", "doc-1", false),
+  );
+  assert.equal(restored.ok, true);
+  assert.equal(restored.status, "restored");
+  assert.equal(restored.changed, true);
+  assert.equal(restored.previouslyInTrash, true);
+  assert.equal(restored.inTrash, false);
+  assert.equal(restored.trashDate, null);
+  assert.equal(restored.readBackVerified, true);
+  assert.equal(socket.page().get("trash"), false);
+  assert.equal(socket.page().has("trashDate"), false);
+  assert.equal(socket.page().has("inTrash"), false);
+
+  const restoredAgain = parseToolResult(
+    await setDocTrashState(socket, "workspace-1", "doc-1", false),
+  );
+  assert.equal(restoredAgain.status, "already_active");
+  assert.equal(restoredAgain.changed, false);
+
+  const legacySocket = new FakeWorkspaceSocket({ staleWorkspaceReadsAfterPush: 1 });
+  legacySocket.page().set("inTrash", true);
+  const normalized = parseToolResult(
+    await setDocTrashState(legacySocket, "workspace-1", "doc-1", true),
+  );
+  assert.equal(normalized.status, "trashed");
+  assert.equal(normalized.changed, true);
+  assert.equal(typeof normalized.trashDate, "number");
+  assert.equal(legacySocket.page().has("inTrash"), false);
+  assert.equal(legacySocket.page().get("trash"), true);
+  assert.equal(legacySocket.page().has("trashDate"), true);
+
+  const eventuallyConsistentSocket = new FakeWorkspaceSocket({ staleWorkspaceReadsAfterPush: 1 });
+  const eventuallyConsistent = parseToolResult(
+    await setDocTrashState(eventuallyConsistentSocket, "workspace-1", "doc-1", true),
+  );
+  assert.equal(eventuallyConsistent.status, "trashed");
+  assert.equal(eventuallyConsistent.readBackVerified, true);
+
+  await assert.rejects(
+    setDocTrashState(new FakeWorkspaceSocket({ metadataExists: false }), "workspace-1", "doc-1", true),
+    /not present in workspace/,
+  );
+  await assert.rejects(
+    setDocTrashState(new FakeWorkspaceSocket(), "workspace-1", "workspace-1", true),
+    /metadata document cannot be moved to trash/,
+  );
+  await assert.rejects(
+    setDocTrashState(new FakeWorkspaceSocket({ pushMode: "error" }), "workspace-1", "doc-1", true),
+    /workspace metadata sync failed/,
+  );
+
+  assert.equal(isRetryableTrashStateError(new Error("workspace metadata sync failed")), true);
+  assert.equal(isRetryableTrashStateError(new Error("space:load-doc timeout after 10000ms")), true);
+  assert.equal(isRetryableTrashStateError(new Error("Document doc-1 is not present in workspace workspace-1.")), false);
+  assert.equal(isRetryableTrashStateError(new Error("The workspace metadata document cannot be moved to trash.")), false);
+  assert.equal(isRetryableTrashStateError(new Error("permission denied")), false);
+}
+
+async function testWorkspaceReceipts() {
+  const registry = new ToolRegistry();
+  let behavior = "false";
+  const gql = {
+    async request() {
+      if (behavior === "throw") throw new Error("workspace service unavailable");
+      return { deleteWorkspace: behavior === "true" };
+    },
+  };
+  registerWorkspaceTools(registry, gql);
+  const deleteWorkspace = registry.tools.get("delete_workspace");
+  assert.equal(typeof deleteWorkspace, "function");
+
+  const notConfirmedResult = await deleteWorkspace({
+    id: "workspace-1",
+    confirmWorkspaceId: "workspace-1",
+  });
+  const notConfirmed = assertStableFailure(notConfirmedResult, "workspace_delete_failed");
+  assert.equal(notConfirmed.deleted, false);
+  assert.match(notConfirmed.error, /did not confirm workspace deletion/);
+
+  behavior = "throw";
+  const failedResult = await deleteWorkspace({
+    id: "workspace-1",
+    confirmWorkspaceId: "workspace-1",
+  });
+  const failed = assertStableFailure(failedResult, "workspace_delete_failed");
+  assert.equal(failed.deleted, false);
+  assert.match(failed.error, /workspace service unavailable/);
+
+  behavior = "true";
+  const confirmed = parseToolResult(await deleteWorkspace({
+    id: "workspace-1",
+    confirmWorkspaceId: "workspace-1",
+  }));
+  assert.equal(confirmed.ok, true);
+  assert.equal(confirmed.status, "deleted");
+  assert.equal(confirmed.deleted, true);
+  assert.equal(confirmed.success, true);
+  assert.equal("message" in confirmed, false);
+}
+
+async function testBlobReceipts() {
+  const registry = new ToolRegistry();
+  let behavior = "false";
+  const gql = {
+    async request(query) {
+      if (behavior === "throw") throw new Error("blob service unavailable");
+      if (query.includes("deleteBlob")) return { deleteBlob: behavior === "true" };
+      if (query.includes("releaseDeletedBlobs")) return { releaseDeletedBlobs: behavior === "true" };
+      throw new Error("Unexpected blob mutation");
+    },
+  };
+  registerBlobTools(registry, gql);
+  const deleteBlob = registry.tools.get("delete_blob");
+  const cleanupBlobs = registry.tools.get("cleanup_blobs");
+  assert.equal(typeof deleteBlob, "function");
+  assert.equal(typeof cleanupBlobs, "function");
+
+  const unconfirmedDelete = assertStableFailure(
+    await deleteBlob({ workspaceId: "workspace-1", key: "blob-1" }),
+    "blob_delete_failed",
+    "not_applied",
+  );
+  assert.equal(unconfirmedDelete.deleted, false);
+  assert.match(unconfirmedDelete.error, /did not confirm blob deletion/);
+
+  const unconfirmedCleanup = assertStableFailure(
+    await cleanupBlobs({ workspaceId: "workspace-1", confirmWorkspaceId: "workspace-1" }),
+    "blob_cleanup_failed",
+    "not_applied",
+  );
+  assert.equal(unconfirmedCleanup.blobsReleased, false);
+  assert.match(unconfirmedCleanup.error, /did not confirm deleted blob cleanup/);
+
+  behavior = "throw";
+  const failedDelete = assertStableFailure(
+    await deleteBlob({ workspaceId: "workspace-1", key: "blob-1" }),
+    "blob_delete_failed",
+  );
+  assert.match(failedDelete.error, /blob service unavailable/);
+  const failedCleanup = assertStableFailure(
+    await cleanupBlobs({ workspaceId: "workspace-1", confirmWorkspaceId: "workspace-1" }),
+    "blob_cleanup_failed",
+  );
+  assert.match(failedCleanup.error, /blob service unavailable/);
+
+  behavior = "true";
+  const deleted = parseToolResult(await deleteBlob({ workspaceId: "workspace-1", key: "blob-1" }));
+  assert.equal(deleted.ok, true);
+  assert.equal(deleted.status, "deleted");
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.success, true);
+  const cleaned = parseToolResult(await cleanupBlobs({
+    workspaceId: "workspace-1",
+    confirmWorkspaceId: "workspace-1",
+  }));
+  assert.equal(cleaned.ok, true);
+  assert.equal(cleaned.status, "completed");
+  assert.equal(cleaned.blobsReleased, true);
+  assert.equal(cleaned.success, true);
+}
+
+async function testAdditionalMutationReceipts() {
+  const commentRegistry = new ToolRegistry();
+  let commentBehavior = "false";
+  registerCommentTools(commentRegistry, {
+    async request(query) {
+      if (commentBehavior === "throw") throw new Error("comment service unavailable");
+      if (query.includes("UpdateComment")) return { updateComment: commentBehavior === "true" };
+      if (query.includes("DeleteComment")) return { deleteComment: commentBehavior === "true" };
+      if (query.includes("ResolveComment")) return { resolveComment: commentBehavior === "true" };
+      throw new Error("Unexpected comment mutation");
+    },
+  }, {});
+
+  const updateComment = commentRegistry.tools.get("update_comment");
+  const deleteComment = commentRegistry.tools.get("delete_comment");
+  const resolveComment = commentRegistry.tools.get("resolve_comment");
+  assertStableFailure(await updateComment({ id: "comment-1", content: "updated" }), "comment_update_failed", "not_applied");
+  assertStableFailure(await deleteComment({ id: "comment-1" }), "comment_delete_failed", "not_applied");
+  assertStableFailure(await resolveComment({ id: "comment-1", resolved: true }), "comment_resolve_failed", "not_applied");
+
+  commentBehavior = "throw";
+  assertStableFailure(await deleteComment({ id: "comment-1" }), "comment_delete_failed");
+
+  commentBehavior = "true";
+  assert.equal(parseToolResult(await updateComment({ id: "comment-1", content: "updated" })).ok, true);
+  assert.equal(parseToolResult(await deleteComment({ id: "comment-1" })).ok, true);
+  assert.equal(parseToolResult(await resolveComment({ id: "comment-1", resolved: true })).ok, true);
+
+  const notificationRegistry = new ToolRegistry();
+  let notificationBehavior = "false";
+  registerNotificationTools(notificationRegistry, {
+    async request(query) {
+      if (notificationBehavior === "throw") throw new Error("notification service unavailable");
+      if (query.includes("ReadAllNotifications")) {
+        return { readAllNotifications: notificationBehavior === "true" };
+      }
+      return { currentUser: { notifications: { edges: [] } } };
+    },
+  });
+  const listNotifications = notificationRegistry.tools.get("list_notifications");
+  const readAllNotifications = notificationRegistry.tools.get("read_all_notifications");
+  assertStableFailure(await readAllNotifications({}), "notification_update_failed", "not_applied");
+  notificationBehavior = "throw";
+  assertStableFailure(await listNotifications({}), "notification_list_failed", "failed", true);
+  assertStableFailure(await readAllNotifications({}), "notification_update_failed", "failed", true);
+  notificationBehavior = "true";
+  const readAllResult = parseToolResult(await readAllNotifications({}));
+  assert.equal(readAllResult.success, true);
+  assert.equal(readAllResult.applied, true);
+  assert.equal(readAllResult.status, "applied");
+  assert.equal(readAllResult.serverResult, true);
+
+  const workspaceRegistry = new ToolRegistry();
+  let workspaceBehavior = "false";
+  registerWorkspaceTools(workspaceRegistry, {
+    async request(query) {
+      if (workspaceBehavior === "throw") throw new Error("workspace update unavailable");
+      if (query.includes("UpdateWorkspace")) {
+        return {
+          updateWorkspace: workspaceBehavior === "true"
+            ? { id: "workspace-1", public: true, enableAi: false }
+            : null,
+        };
+      }
+      throw new Error("Unexpected workspace mutation");
+    },
+  });
+  const updateWorkspace = workspaceRegistry.tools.get("update_workspace");
+  assertStableFailure(await updateWorkspace({ id: "workspace-1", public: true }), "workspace_update_failed", "not_applied");
+  workspaceBehavior = "throw";
+  assertStableFailure(await updateWorkspace({ id: "workspace-1", public: true }), "workspace_update_failed");
+  workspaceBehavior = "true";
+  assert.equal(parseToolResult(await updateWorkspace({ id: "workspace-1", public: true })).ok, true);
+}
+
+testAcknowledgedDeleteTrackerBounds();
+await testDeleteDocProtocol();
+await testDocumentReceipts();
+await testDocumentTrashReceipts();
+await testWorkspaceReceipts();
+await testBlobReceipts();
+await testAdditionalMutationReceipts();
+console.log("Destructive mutation acknowledgement tests passed");

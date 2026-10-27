@@ -1,0 +1,425 @@
+#!/usr/bin/env node
+import { testResourceName, testTempPath } from './require-destructive-test-safety.mjs';
+
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import * as Y from "yjs";
+
+import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc } from "../dist/ws.js";
+import { acquireCredentials } from "./acquire-credentials.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MCP_SERVER_PATH = path.resolve(__dirname, "..", "dist", "index.js");
+
+const BASE_URL = process.env.AFFINE_BASE_URL || "http://localhost:3010";
+const EMAIL = process.env.AFFINE_ADMIN_EMAIL || process.env.AFFINE_EMAIL || "test@affine.local";
+const PASSWORD = process.env.AFFINE_ADMIN_PASSWORD || process.env.AFFINE_PASSWORD;
+if (!PASSWORD) {
+  throw new Error("AFFINE_ADMIN_PASSWORD env var required — run: . tests/generate-test-env.sh");
+}
+
+const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS || "60000");
+const MARKDOWN = [
+  "## A **bold** heading",
+  "",
+  "Intro **paragraph** text",
+  "",
+  "> A **bold** blockquote",
+  "",
+  "> [!NOTE]",
+  "> A **bold** callout",
+  "",
+  "- **Top level** item",
+  "  - **Nested level** item",
+  "",
+  "| Role | Notes |",
+  "| --- | --- |",
+  "| **ADMIN** | Full access |",
+  "| Normal | **Important** value |",
+  "",
+  "Euler $e^{i\\pi} + 1 = 0$ with spacing $a \\, b$",
+  "",
+  "$$",
+  "\\int_0^1 x \\, dx",
+  "$$",
+].join("\n");
+const EXPECTED_INLINE_LATEX = ["e^{i\\pi} + 1 = 0", "a \\, b"];
+const EXPECTED_BLOCK_LATEX = "\\int_0^1 x \\, dx";
+
+function parseContent(result) {
+  const text = result?.content?.[0]?.text;
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function assertResult(toolName, result) {
+  if (result?.isError) {
+    throw new Error(`${toolName} MCP error: ${result?.content?.[0]?.text || "unknown"}`);
+  }
+  const parsed = parseContent(result);
+  if (parsed && typeof parsed === "object" && parsed.error) {
+    throw new Error(`${toolName} failed: ${parsed.error}`);
+  }
+  return parsed;
+}
+
+function expect(condition, message) {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
+function textFromDelta(delta) {
+  return delta.map(entry => String(entry.insert ?? "")).join("");
+}
+
+function hasBoldRun(delta, expectedText) {
+  return delta.some(entry => entry.insert === expectedText && entry.attributes?.bold === true);
+}
+
+function childIdsFrom(value) {
+  if (!(value instanceof Y.Array)) return [];
+  const childIds = [];
+  value.forEach(entry => {
+    if (typeof entry === "string") {
+      childIds.push(entry);
+      return;
+    }
+    if (Array.isArray(entry)) {
+      for (const child of entry) {
+        if (typeof child === "string") {
+          childIds.push(child);
+        }
+      }
+    }
+  });
+  return childIds;
+}
+
+function getBlocks(doc) {
+  return doc.getMap("blocks");
+}
+
+function findBlock(blocks, predicate) {
+  for (const [id, block] of blocks) {
+    if (!(block instanceof Y.Map)) continue;
+    if (predicate(String(id), block)) {
+      return { id: String(id), block };
+    }
+  }
+  return null;
+}
+
+function listBlockDeltas(blocks) {
+  const deltas = [];
+  for (const [, block] of blocks) {
+    if (!(block instanceof Y.Map)) continue;
+    if (block.get("sys:flavour") !== "affine:list") continue;
+    const text = block.get("prop:text");
+    if (!(text instanceof Y.Text)) continue;
+    deltas.push(text.toDelta());
+  }
+  return deltas;
+}
+
+function tableCellDeltas(tableBlock) {
+  const result = [];
+  for (const [key, value] of tableBlock) {
+    if (!String(key).startsWith("prop:cells.") || !String(key).endsWith(".text")) continue;
+    if (!(value instanceof Y.Text)) continue;
+    result.push(value.toDelta());
+  }
+  return result;
+}
+
+/**
+ * Collect deltas from affine:paragraph blocks matching a given prop:type
+ * (e.g. "text", "quote", "h1"–"h6").
+ */
+function paragraphBlockDeltas(blocks, propType) {
+  const deltas = [];
+  for (const [, block] of blocks) {
+    if (!(block instanceof Y.Map)) continue;
+    if (block.get("sys:flavour") !== "affine:paragraph") continue;
+    if (block.get("prop:type") !== propType) continue;
+    const text = block.get("prop:text");
+    if (!(text instanceof Y.Text)) continue;
+    deltas.push(text.toDelta());
+  }
+  return deltas;
+}
+
+function expectSingleLinkedPageParagraph(blocks, pageId, flow) {
+  const allParagraphs = paragraphBlockDeltas(blocks, "text");
+  const importedParagraphs = allParagraphs.filter(deltas => deltas.length > 0);
+  expect(
+    importedParagraphs.length === 1,
+    `${flow} must materialize one non-empty paragraph (total=${allParagraphs.length}, imported=${importedParagraphs.length}, deltas=${JSON.stringify(allParagraphs)})`,
+  );
+
+  const paragraphDeltas = importedParagraphs[0];
+  const references = paragraphDeltas.filter(
+    delta => delta.attributes?.reference?.type === "LinkedPage",
+  );
+  expect(
+    references.length === 1 && paragraphDeltas.length === 1 && references[0].insert === " ",
+    `${flow} must store only one native LinkedPage sentinel (deltas=${JSON.stringify(paragraphDeltas)})`,
+  );
+  expect(
+    references[0].attributes.reference.pageId === pageId,
+    `${flow} changed the LinkedPage pageId (deltas=${JSON.stringify(paragraphDeltas)})`,
+  );
+}
+
+function expectNativeMath(blocks, flow) {
+  const inlineLatex = paragraphBlockDeltas(blocks, "text")
+    .flat()
+    .filter(delta => typeof delta.attributes?.latex === "string");
+  expect(
+    EXPECTED_INLINE_LATEX.every(latex => inlineLatex.some(delta => delta.attributes.latex === latex && delta.insert === " ")),
+    `${flow} must store inline math as native latex deltas with TeX backslashes intact (deltas=${JSON.stringify(inlineLatex)})`,
+  );
+  const latexBlock = findBlock(blocks, (_, block) => block.get("sys:flavour") === "affine:latex");
+  expect(latexBlock, `${flow} did not create an affine:latex block`);
+  expect(
+    latexBlock.block.get("prop:latex") === EXPECTED_BLOCK_LATEX,
+    `${flow} changed the display math (latex=${JSON.stringify(latexBlock.block.get("prop:latex"))})`,
+  );
+}
+
+/**
+ * Collect deltas from the child paragraph blocks inside affine:callout blocks.
+ */
+function calloutChildDeltas(blocks) {
+  const deltas = [];
+  for (const [, block] of blocks) {
+    if (!(block instanceof Y.Map)) continue;
+    if (block.get("sys:flavour") !== "affine:callout") continue;
+    const children = block.get("sys:children");
+    for (const childId of childIdsFrom(children)) {
+      const child = blocks.get(childId);
+      if (!(child instanceof Y.Map)) continue;
+      const text = child.get("prop:text");
+      if (!(text instanceof Y.Text)) continue;
+      deltas.push(text.toDelta());
+    }
+  }
+  return deltas;
+}
+
+async function loadLiveDoc(workspaceId, docId, cookie) {
+  const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(`${BASE_URL}/graphql`), cookie, undefined);
+  try {
+    await joinWorkspace(socket, workspaceId);
+    const snapshot = await loadDoc(socket, workspaceId, docId);
+    if (!snapshot.missing) {
+      throw new Error(`Document ${docId} not found`);
+    }
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+    return doc;
+  } finally {
+    socket.disconnect();
+  }
+}
+
+async function main() {
+  console.log("=== Markdown Rich Text Import Test ===");
+  console.log(`Base URL: ${BASE_URL}`);
+  console.log(`Server: ${MCP_SERVER_PATH}`);
+
+  const client = new Client({ name: "affine-mcp-markdown-richtext-test", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: "node",
+    args: [MCP_SERVER_PATH],
+    cwd: path.resolve(__dirname, ".."),
+    env: {
+      AFFINE_BASE_URL: BASE_URL,
+      AFFINE_EMAIL: EMAIL,
+      AFFINE_PASSWORD: PASSWORD,
+      AFFINE_LOGIN_AT_START: "sync",
+      XDG_CONFIG_HOME: testTempPath('markdown-richtext-config'),
+    },
+    stderr: "pipe",
+  });
+
+  transport.stderr?.on("data", chunk => {
+    process.stderr.write(`[mcp-server] ${chunk}`);
+  });
+
+  async function call(toolName, args = {}) {
+    console.log(`  → ${toolName}(${JSON.stringify(args)})`);
+    const result = await client.callTool({ name: toolName, arguments: args }, undefined, { timeout: TOOL_TIMEOUT_MS });
+    const parsed = assertResult(toolName, result);
+    console.log("    ✓ OK");
+    return parsed;
+  }
+
+  await client.connect(transport);
+
+  try {
+    const workspace = await call("create_workspace", { name: testResourceName('markdown-richtext') });
+    const workspaceId = workspace?.id;
+    expect(workspaceId, "create_workspace did not return id");
+
+    const referenceTarget = await call("create_doc", {
+      workspaceId,
+      title: "Markdown Linked Page Target",
+      content: "",
+    });
+    expect(referenceTarget?.docId, "create_doc did not return LinkedPage target docId");
+    const markdown = `${MARKDOWN}\n\nSee [the target page](LinkedPage:${referenceTarget.docId}).`;
+
+    const createResult = await call("create_doc_from_markdown", {
+      workspaceId,
+      title: "Markdown Rich Text Import",
+      markdown,
+    });
+    const createdDocId = createResult?.docId;
+    expect(createdDocId, "create_doc_from_markdown did not return docId");
+
+    const { cookie } = await acquireCredentials(BASE_URL, EMAIL, PASSWORD);
+    expect(cookie, "failed to acquire cookie for live snapshot inspection");
+
+    const createdDoc = await loadLiveDoc(workspaceId, createdDocId, cookie);
+    const createdBlocks = getBlocks(createdDoc);
+
+    // --- Heading ---
+    const createdHeadingDeltas = paragraphBlockDeltas(createdBlocks, "h2");
+    expect(createdHeadingDeltas.some(delta => hasBoldRun(delta, "bold")), "heading did not preserve bold");
+
+    // --- Paragraph ---
+    const createdParagraphDeltas = paragraphBlockDeltas(createdBlocks, "text");
+    expect(createdParagraphDeltas.some(delta => hasBoldRun(delta, "paragraph")), "paragraph did not preserve bold");
+    const createdReferences = createdParagraphDeltas
+      .flat()
+      .filter(delta => delta.attributes?.reference?.type === "LinkedPage");
+    expect(createdReferences.length === 1, "create_doc_from_markdown must create exactly one LinkedPage reference");
+    const createdReference = createdReferences[0];
+    expect(createdReference.insert === " ", "create_doc_from_markdown must store the native space sentinel");
+    expect(createdReference.attributes.reference.pageId === referenceTarget.docId, "create_doc_from_markdown changed the LinkedPage pageId");
+
+    const standaloneResult = await call("create_doc_from_markdown", {
+      workspaceId,
+      title: "Markdown Standalone LinkedPage",
+      markdown: `[standalone target](LinkedPage:${referenceTarget.docId})`,
+    });
+    expect(standaloneResult?.docId, "create_doc_from_markdown did not return standalone LinkedPage docId");
+    const standaloneDoc = await loadLiveDoc(workspaceId, standaloneResult.docId, cookie);
+    expectSingleLinkedPageParagraph(
+      getBlocks(standaloneDoc),
+      referenceTarget.docId,
+      "standalone create_doc_from_markdown LinkedPage import",
+    );
+
+    const appendDoc = await call("create_doc", {
+      workspaceId,
+      title: "Markdown Appended LinkedPage",
+      content: "",
+    });
+    expect(appendDoc?.docId, "create_doc did not return append target docId");
+    await call("append_markdown", {
+      workspaceId,
+      docId: appendDoc.docId,
+      markdown: `[appended target](LinkedPage:${referenceTarget.docId})`,
+    });
+    const appendedDoc = await loadLiveDoc(workspaceId, appendDoc.docId, cookie);
+    expectSingleLinkedPageParagraph(
+      getBlocks(appendedDoc),
+      referenceTarget.docId,
+      "append_markdown LinkedPage import",
+    );
+
+    // --- Quote ---
+    const createdQuoteDeltas = paragraphBlockDeltas(createdBlocks, "quote");
+    expect(createdQuoteDeltas.some(delta => hasBoldRun(delta, "bold")), "quote did not preserve bold");
+
+    // --- Callout ---
+    const createdCalloutDeltas = calloutChildDeltas(createdBlocks);
+    expect(createdCalloutDeltas.some(delta => hasBoldRun(delta, "bold")), "callout did not preserve bold");
+
+    // --- List ---
+    const createdListDeltas = listBlockDeltas(createdBlocks);
+    expect(createdListDeltas.some(delta => hasBoldRun(delta, "Top level")), "top-level list item did not preserve bold");
+    expect(createdListDeltas.some(delta => hasBoldRun(delta, "Nested level")), "nested list item did not preserve bold");
+
+    const createdTable = findBlock(createdBlocks, (_, block) => block.get("sys:flavour") === "affine:table");
+    expect(createdTable, "table block not found after create_doc_from_markdown");
+    const createdTableDeltas = tableCellDeltas(createdTable.block);
+    expect(createdTableDeltas.some(delta => hasBoldRun(delta, "ADMIN")), "table cell bold text did not preserve bold");
+    expect(createdTableDeltas.some(delta => hasBoldRun(delta, "Important")), "table cell mixed bold text did not preserve bold");
+
+    // --- Math ---
+    expectNativeMath(createdBlocks, "create_doc_from_markdown");
+
+    const emptyDoc = await call("create_doc", {
+      workspaceId,
+      title: "Markdown Replace Rich Text",
+      content: "",
+    });
+    const replaceDocId = emptyDoc?.docId;
+    expect(replaceDocId, "create_doc did not return docId");
+
+    await call("replace_doc_with_markdown", {
+      workspaceId,
+      docId: replaceDocId,
+      markdown,
+    });
+
+    const replacedDoc = await loadLiveDoc(workspaceId, replaceDocId, cookie);
+    const replacedBlocks = getBlocks(replacedDoc);
+
+    // --- Heading ---
+    const replacedHeadingDeltas = paragraphBlockDeltas(replacedBlocks, "h2");
+    expect(replacedHeadingDeltas.some(delta => hasBoldRun(delta, "bold")), "replace_doc_with_markdown heading lost bold");
+
+    // --- Paragraph ---
+    const replacedParagraphDeltas = paragraphBlockDeltas(replacedBlocks, "text");
+    expect(replacedParagraphDeltas.some(delta => hasBoldRun(delta, "paragraph")), "replace_doc_with_markdown paragraph lost bold");
+    const replacedReferences = replacedParagraphDeltas
+      .flat()
+      .filter(delta => delta.attributes?.reference?.type === "LinkedPage");
+    expect(replacedReferences.length === 1, "replace_doc_with_markdown must create exactly one LinkedPage reference");
+    const replacedReference = replacedReferences[0];
+    expect(replacedReference.insert === " ", "replace_doc_with_markdown must store the native space sentinel");
+    expect(replacedReference.attributes.reference.pageId === referenceTarget.docId, "replace_doc_with_markdown changed the LinkedPage pageId");
+
+    // --- Quote ---
+    const replacedQuoteDeltas = paragraphBlockDeltas(replacedBlocks, "quote");
+    expect(replacedQuoteDeltas.some(delta => hasBoldRun(delta, "bold")), "replace_doc_with_markdown quote lost bold");
+
+    // --- Callout ---
+    const replacedCalloutDeltas = calloutChildDeltas(replacedBlocks);
+    expect(replacedCalloutDeltas.some(delta => hasBoldRun(delta, "bold")), "replace_doc_with_markdown callout lost bold");
+
+    // --- List ---
+    const replacedListDeltas = listBlockDeltas(replacedBlocks);
+    expect(replacedListDeltas.some(delta => hasBoldRun(delta, "Top level")), "replace_doc_with_markdown top-level list item lost bold");
+    expect(replacedListDeltas.some(delta => hasBoldRun(delta, "Nested level")), "replace_doc_with_markdown nested list item lost bold");
+
+    const replacedTable = findBlock(replacedBlocks, (_, block) => block.get("sys:flavour") === "affine:table");
+    expect(replacedTable, "table block not found after replace_doc_with_markdown");
+    const replacedTableDeltas = tableCellDeltas(replacedTable.block);
+    expect(replacedTableDeltas.some(delta => hasBoldRun(delta, "ADMIN")), "replace_doc_with_markdown table cell bold text lost bold");
+    expect(replacedTableDeltas.some(delta => hasBoldRun(delta, "Important")), "replace_doc_with_markdown table cell mixed bold text lost bold");
+
+    // --- Math ---
+    expectNativeMath(replacedBlocks, "replace_doc_with_markdown");
+
+    console.log("=== Markdown rich text import test passed ===");
+  } finally {
+    await transport.close();
+  }
+}
+
+main().catch(error => {
+  console.error(`FAILED: ${error.message}`);
+  process.exit(1);
+});

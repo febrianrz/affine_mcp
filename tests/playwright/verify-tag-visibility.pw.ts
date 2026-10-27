@@ -1,0 +1,181 @@
+import { test, expect } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { signInToAffine } from './sign-in.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+interface TagVisibilityState {
+  baseUrl: string;
+  email: string;
+  workspaceId: string;
+  workspaceName: string;
+  firstDocId: string;
+  docId: string;
+  docTitle: string;
+  tag: string;
+  error?: string;
+}
+
+const STATE_PATH = path.resolve(__dirname, '..', 'test-tag-visibility-state.json');
+const AUTH_STATE_PATH = path.resolve(__dirname, '..', 'playwright-auth-state.json');
+
+let state: TagVisibilityState;
+
+test.beforeAll(() => {
+  if (!fs.existsSync(STATE_PATH)) {
+    throw new Error(
+      `State file not found: ${STATE_PATH}\n` +
+      'Run "node tests/test-tag-visibility.mjs" first to create tag visibility test data.',
+    );
+  }
+  state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  if (state.error) {
+    throw new Error(`State file contains error from MCP test: ${state.error}`);
+  }
+  if (!state.workspaceId || !state.firstDocId || !state.docId || !state.tag) {
+    throw new Error('State file missing workspaceId, firstDocId, docId, or tag');
+  }
+});
+
+const password = process.env.AFFINE_ADMIN_PASSWORD!;
+if (!password) throw new Error('AFFINE_ADMIN_PASSWORD env var required');
+
+async function dismissModals(page: any, rounds: number) {
+  for (let i = 0; i < rounds; i++) {
+    await page.waitForTimeout(1_000);
+    const dismissBtn = page.locator(
+      'button:has-text("Skip"), button:has-text("Got it"), button:has-text("Close"), ' +
+      'button:has-text("Dismiss"), button:has-text("OK"), button:has-text("Later"), ' +
+      '[data-testid="modal-close"], .modal-close, button[aria-label="Close"]',
+    );
+    if (await dismissBtn.count() > 0) {
+      await dismissBtn.first().click({ timeout: 2_000 }).catch(() => {});
+    } else {
+      break;
+    }
+  }
+}
+
+test.describe.serial('Tag Visibility Verification', () => {
+  test('login to AFFiNE', async ({ page, context }) => {
+    test.setTimeout(180_000);
+    const baseUrl = state.baseUrl;
+
+    await signInToAffine(page, { baseUrl, email: state.email, password });
+    await dismissModals(page, 5);
+
+    expect(page.url()).not.toContain('/sign-in');
+    await context.storageState({ path: AUTH_STATE_PATH });
+  });
+
+  test('verify tag is visible in document UI', async ({ browser }) => {
+    const context = await browser.newContext({
+      storageState: AUTH_STATE_PATH,
+    });
+    const page = await context.newPage();
+
+    try {
+      const docUrl = `${state.baseUrl}/workspace/${state.workspaceId}/${state.docId}`;
+      await page.goto(docUrl);
+      await page.waitForLoadState('domcontentloaded');
+
+      if (page.url().includes('/sign-in')) {
+        throw new Error('Redirected to sign-in — login test did not persist auth state');
+      }
+
+      await dismissModals(page, 4);
+      await page.waitForTimeout(5_000);
+
+      const tagValue = page.locator('[data-testid="property-tags-value"]').filter({ hasText: state.tag }).first();
+
+      // If properties are collapsed, expand Info first.
+      if (await tagValue.count() === 0) {
+        const infoHeaderButton = page.getByRole('button', { name: 'Info' }).first();
+        if (await infoHeaderButton.count()) {
+          await infoHeaderButton.click({ timeout: 2_000 }).catch(() => {});
+          await page.waitForTimeout(1_000);
+        }
+      }
+
+      // If Workspace properties are collapsed, expand the section.
+      if (await tagValue.count() === 0) {
+        const workspaceTrigger = page.locator('[data-testid="property-collapsible-section-trigger"]').first();
+        if (await workspaceTrigger.count()) {
+          await workspaceTrigger.click({ timeout: 2_000 }).catch(() => {});
+          await page.waitForTimeout(1_000);
+        }
+      }
+
+      await expect(tagValue).toBeVisible({ timeout: 20_000 });
+    } finally {
+      await context.close();
+    }
+  });
+
+  test('keep page roots compatible with AFFiNE history restore', async ({ browser }) => {
+    const context = await browser.newContext({
+      storageState: AUTH_STATE_PATH,
+    });
+    const page = await context.newPage();
+    const consoleErrors: string[] = [];
+    page.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    page.on('pageerror', error => consoleErrors.push(error.message));
+
+    async function assertBlocksOnlyRoot(docId: string) {
+      await page.goto(`${state.baseUrl}/workspace/${state.workspaceId}/${docId}`);
+      await page.waitForLoadState('domcontentloaded');
+      if (page.url().includes('/sign-in')) {
+        throw new Error('Redirected to sign-in — login state was not persisted');
+      }
+      await dismissModals(page, 4);
+      await page.waitForFunction(
+        () => Boolean((globalThis as any).currentEditor?.page?.spaceDoc),
+        undefined,
+        { timeout: 30_000 },
+      );
+
+      const roots = await page.evaluate(() => {
+        const share = (globalThis as any).currentEditor.page.spaceDoc.share;
+        return [...share.entries()].map(([key, value]) => ({
+          key,
+          type: value?.constructor?.name,
+        }));
+      });
+      expect(roots).toEqual([{ key: 'blocks', type: 'YMap' }]);
+    }
+
+    try {
+      await assertBlocksOnlyRoot(state.firstDocId);
+      await assertBlocksOnlyRoot(state.docId);
+
+      consoleErrors.length = 0;
+      const menuButton = page.locator('[data-testid="header-dropDownButton"]').first();
+      await expect(menuButton).toBeVisible({ timeout: 30_000 });
+      await menuButton.click();
+
+      const historyOption = page.locator('[data-testid="editor-option-menu-history"]').first();
+      await expect(historyOption).toBeVisible({ timeout: 10_000 });
+      await historyOption.click();
+
+      const restoreCurrent = page.getByRole('button', { name: /Restore current version/i }).first();
+      await expect(restoreCurrent).toBeVisible({ timeout: 30_000 });
+      await restoreCurrent.click();
+
+      const restoreConfirmation = page.getByRole('button', { name: /^Restore$/i }).last();
+      await expect(restoreConfirmation).toBeVisible({ timeout: 10_000 });
+      await restoreConfirmation.click();
+      await page.waitForTimeout(2_000);
+
+      expect(
+        consoleErrors.some(error => /Only expect this value is ["']blocks["']/.test(error)),
+      ).toBe(false);
+    } finally {
+      await context.close();
+    }
+  });
+});

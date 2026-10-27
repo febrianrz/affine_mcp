@@ -1,0 +1,1488 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import * as Y from "yjs";
+import { generateKeyBetween } from "fractional-indexing";
+
+import { GraphQLClient } from "../graphqlClient.js";
+import { text } from "../util/mcp.js";
+import { secureRandomString } from "../util/random.js";
+import {
+  connectWorkspaceSocket,
+  joinWorkspace,
+  loadDoc,
+  pushDocUpdate,
+  wsUrlFromGraphQLEndpoint,
+} from "../ws.js";
+
+const WorkspaceId = z.string().min(1, "workspaceId required").describe("AFFiNE workspace id. Omit only when AFFINE_WORKSPACE_ID is configured.");
+const DocId = z.string().min(1, "docId required").describe("AFFiNE document id.");
+const CollectionId = z.string().min(1, "collectionId required").describe("AFFiNE collection id from list_collections or create_collection.");
+const FolderId = z.string().min(1, "folderId required").describe("AFFiNE organize folder node id.");
+const OrganizeNodeId = z.string().min(1, "nodeId required").describe("AFFiNE organize node id from list_organize_nodes.");
+const FolderName = z.string().trim().min(1, "name required").describe("Non-empty sidebar folder or collection name.");
+const CollectionRuleValueSchema = z.string().trim().min(1, "rule value required");
+const CollectionRuleValuesSchema = z.array(CollectionRuleValueSchema).min(1, "rule values required");
+const CollectionRuleSchema = z.union([
+  z.object({ field: z.literal("title"), operator: z.enum(["contains", "equals", "startsWith"]), value: CollectionRuleValueSchema }),
+  z.object({ field: z.literal("tag"), operator: z.enum(["contains", "equals"]), value: CollectionRuleValueSchema }),
+  z.object({ field: z.literal("docId"), operator: z.literal("equals"), value: CollectionRuleValueSchema }),
+  z.object({ field: z.literal("docId"), operator: z.literal("in"), value: CollectionRuleValuesSchema }),
+]).describe("Single AFFiNE collection filter rule.");
+const CollectionRulesSchema = z.object({
+  match: z.enum(["all", "any"]).optional().describe("Whether all filters or any filter must match. Defaults to all."),
+  filters: z.array(CollectionRuleSchema).describe("Collection filter rules used to build the allow-list."),
+}).describe("AFFiNE collection rule set.");
+
+type CollectionRulesInput = z.infer<typeof CollectionRulesSchema>;
+
+type CollectionInfo = {
+  id: string;
+  name: string;
+  rules: {
+    match: "all" | "any";
+    filters: CollectionRuleFilter[];
+  };
+  allowList: string[];
+};
+
+type CollectionLookup = {
+  index: number;
+  raw: Record<string, unknown>;
+  collection: CollectionInfo;
+};
+
+type CollectionMutationPatch = Partial<Pick<CollectionInfo, "name" | "rules" | "allowList">>;
+
+type CollectionRuleField = "title" | "tag" | "docId";
+type CollectionRuleOperator = "contains" | "equals" | "startsWith" | "in";
+type CollectionRuleFilter = {
+  field: CollectionRuleField;
+  operator: CollectionRuleOperator;
+  value: string | string[];
+};
+
+type WorkspaceTagOption = {
+  id: string;
+  value: string;
+};
+
+type WorkspaceDocSummary = {
+  id: string;
+  title: string | null;
+  tags: string[];
+  createDate: number | null;
+  updatedDate: number | null;
+};
+
+type OrganizeNodeRecord = {
+  id: string;
+  parentId: string | null;
+  type: "folder" | "doc" | "tag" | "collection";
+  data: string;
+  index: string;
+};
+
+function generateId(length = 21): string {
+  const chars = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
+  return secureRandomString(length, chars);
+}
+
+function hasSamePrefix(a: string, b: string): boolean {
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+// Adapted from AFFiNE's packages/common/infra/src/utils/fractional-indexing.ts
+function generateFractionalIndexingKeyBetween(
+  a: string | null,
+  b: string | null
+): string {
+  const randomSize = 32;
+
+  function postfix(length = randomSize): string {
+    const chars = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    return secureRandomString(length, chars);
+  }
+
+  function subkey(key: string | null): string | null {
+    if (key === null) {
+      return null;
+    }
+    if (key.length <= randomSize + 1) {
+      return key;
+    }
+    return key.substring(0, key.length - randomSize - 1);
+  }
+
+  const aSubkey = subkey(a);
+  const bSubkey = subkey(b);
+
+  if (aSubkey === null && bSubkey === null) {
+    return generateKeyBetween(null, null) + "0" + postfix();
+  }
+  if (aSubkey === null && bSubkey !== null) {
+    return generateKeyBetween(null, bSubkey) + "0" + postfix();
+  }
+  if (bSubkey === null && aSubkey !== null) {
+    return generateKeyBetween(aSubkey, null) + "0" + postfix();
+  }
+  if (aSubkey !== null && bSubkey !== null) {
+    if (hasSamePrefix(aSubkey, bSubkey) && a !== null && b !== null) {
+      return generateKeyBetween(a, b) + "0" + postfix();
+    }
+    return generateKeyBetween(aSubkey, bSubkey) + "0" + postfix();
+  }
+  throw new Error("Unreachable fractional indexing state");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  const candidate = value instanceof Y.Map ? value.toJSON() : value;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  return candidate as Record<string, unknown>;
+}
+
+function normalizeCollection(value: unknown): CollectionInfo | null {
+  const collection = asRecord(value);
+  if (!collection) {
+    return null;
+  }
+  if (typeof collection.id !== "string" || typeof collection.name !== "string") {
+    return null;
+  }
+  const allowList = Array.isArray(collection.allowList)
+    ? collection.allowList.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  const rules = normalizeCollectionRules(collection.rules);
+
+  return {
+    id: collection.id,
+    name: collection.name,
+    rules,
+    allowList,
+  };
+}
+
+function normalizeOrganizeNode(value: unknown): OrganizeNodeRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== "string" ||
+    typeof raw.type !== "string" ||
+    typeof raw.data !== "string" ||
+    typeof raw.index !== "string"
+  ) {
+    return null;
+  }
+  if (!["folder", "doc", "tag", "collection"].includes(raw.type)) {
+    return null;
+  }
+  return {
+    id: raw.id,
+    parentId:
+      raw.parentId === null || typeof raw.parentId === "string" ? (raw.parentId as string | null) : null,
+    type: raw.type as OrganizeNodeRecord["type"],
+    data: raw.data,
+    index: raw.index,
+  };
+}
+
+function specialWorkspaceDbDocId(workspaceId: string, tableName: string): string {
+  return `db$${workspaceId}$${tableName}`;
+}
+
+function isDeletedRecord(record: Y.Map<any>): boolean {
+  return record.get("$$DELETED") === true || record.size === 0;
+}
+
+function ensureRecord(doc: Y.Doc, id: string): Y.Map<any> {
+  return doc.getMap(id);
+}
+
+function deleteRecord(record: Y.Map<any>, keepId = true): void {
+  const keys = Array.from(record.keys());
+  for (const key of keys) {
+    if (keepId && key === "id") {
+      continue;
+    }
+    record.delete(key);
+  }
+  record.set("$$DELETED", true);
+}
+
+function readCollections(array: Y.Array<any>): CollectionInfo[] {
+  const collections: CollectionInfo[] = [];
+  for (let i = 0; i < array.length; i += 1) {
+    const normalized = normalizeCollection(array.get(i));
+    if (normalized) {
+      collections.push(normalized);
+    }
+  }
+  return collections;
+}
+
+function findCollection(array: Y.Array<any>, id: string): CollectionLookup | null {
+  for (let i = 0; i < array.length; i += 1) {
+    const raw = asRecord(array.get(i));
+    const collection = normalizeCollection(raw);
+    if (collection?.id === id && raw) {
+      return { index: i, raw, collection };
+    }
+  }
+  return null;
+}
+
+function readOrganizeNodes(doc: Y.Doc): OrganizeNodeRecord[] {
+  const nodes: OrganizeNodeRecord[] = [];
+  for (const key of doc.share.keys()) {
+    if (!doc.share.has(key)) {
+      continue;
+    }
+    const record = doc.getMap(key);
+    if (!(record instanceof Y.Map) || isDeletedRecord(record)) {
+      continue;
+    }
+    const normalized = normalizeOrganizeNode(record.toJSON());
+    if (normalized) {
+      nodes.push(normalized);
+    }
+  }
+  return nodes;
+}
+
+function organizeNodeMap(nodes: OrganizeNodeRecord[]): Map<string, OrganizeNodeRecord> {
+  return new Map(nodes.map(node => [node.id, node] as const));
+}
+
+function getYMap(target: Y.Map<any>, key: string): Y.Map<any> | null {
+  const value = target.get(key);
+  return value instanceof Y.Map ? value : null;
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!(value instanceof Y.Array)) {
+    return [];
+  }
+  const values: string[] = [];
+  value.forEach((entry: unknown) => {
+    if (typeof entry === "string") {
+      values.push(entry);
+    }
+  });
+  return values;
+}
+
+function getTagArray(target: Y.Map<any>, key = "tags"): Y.Array<string> | null {
+  const value = target.get(key);
+  return value instanceof Y.Array ? (value as Y.Array<string>) : null;
+}
+
+function getWorkspaceTagOptionsArray(meta: Y.Map<any>): Y.Array<any> | null {
+  const properties = getYMap(meta, "properties");
+  if (!properties) {
+    return null;
+  }
+  const tags = getYMap(properties, "tags");
+  if (!tags) {
+    return null;
+  }
+  const options = tags.get("options");
+  return options instanceof Y.Array ? options : null;
+}
+
+function getWorkspaceTagOptions(meta: Y.Map<any>): WorkspaceTagOption[] {
+  const options = getWorkspaceTagOptionsArray(meta);
+  if (!options) {
+    return [];
+  }
+
+  const parsed: WorkspaceTagOption[] = [];
+  options.forEach((raw: unknown) => {
+    let id: unknown;
+    let value: unknown;
+    if (raw instanceof Y.Map) {
+      id = raw.get("id");
+      value = raw.get("value");
+    } else if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const record = raw as Record<string, unknown>;
+      id = record.id;
+      value = record.value;
+    }
+
+    if (typeof id !== "string" || typeof value !== "string") {
+      return;
+    }
+    const normalizedId = id.trim();
+    const normalizedValue = value.trim();
+    if (!normalizedId || !normalizedValue) {
+      return;
+    }
+    parsed.push({ id: normalizedId, value: normalizedValue });
+  });
+  return parsed;
+}
+
+function getWorkspaceTagOptionMaps(meta: Y.Map<any>): {
+  byId: Map<string, WorkspaceTagOption>;
+  byValueLower: Map<string, WorkspaceTagOption>;
+} {
+  const options = getWorkspaceTagOptions(meta);
+  const byId = new Map<string, WorkspaceTagOption>();
+  const byValueLower = new Map<string, WorkspaceTagOption>();
+  for (const option of options) {
+    if (!byId.has(option.id)) {
+      byId.set(option.id, option);
+    }
+    const key = option.value.toLocaleLowerCase();
+    if (!byValueLower.has(key)) {
+      byValueLower.set(key, option);
+    }
+  }
+  return { byId, byValueLower };
+}
+
+function resolveTagLabels(tagEntries: string[], byId: Map<string, WorkspaceTagOption>): string[] {
+  const deduped = new Set<string>();
+  const resolved: string[] = [];
+  for (const entry of tagEntries) {
+    const raw = entry.trim();
+    if (!raw) {
+      continue;
+    }
+    const option = byId.get(raw);
+    const label = (option ? option.value : raw).trim();
+    if (!label) {
+      continue;
+    }
+    const dedupeKey = label.toLocaleLowerCase();
+    if (deduped.has(dedupeKey)) {
+      continue;
+    }
+    deduped.add(dedupeKey);
+    resolved.push(label);
+  }
+  return resolved;
+}
+
+function getWorkspacePageEntries(
+  meta: Y.Map<any>,
+  tagOptionById: Map<string, WorkspaceTagOption>
+): WorkspaceDocSummary[] {
+  const pages = meta.get("pages");
+  if (!(pages instanceof Y.Array)) {
+    return [];
+  }
+
+  const entries: WorkspaceDocSummary[] = [];
+  pages.forEach((value: unknown) => {
+    if (!(value instanceof Y.Map)) {
+      return;
+    }
+    const id = value.get("id");
+    if (typeof id !== "string" || id.length === 0) {
+      return;
+    }
+    const title = value.get("title");
+    const createDate = value.get("createDate");
+    const updatedDate = value.get("updatedDate");
+    entries.push({
+      id,
+      title: typeof title === "string" ? title : null,
+      createDate: typeof createDate === "number" ? createDate : null,
+      updatedDate: typeof updatedDate === "number" ? updatedDate : null,
+      tags: resolveTagLabels(getStringArray(getTagArray(value)), tagOptionById),
+    });
+  });
+  return entries;
+}
+
+function normalizeCollectionRuleFilter(value: unknown): CollectionRuleFilter | null {
+  const filter = asRecord(value);
+  if (!filter) {
+    return null;
+  }
+  if (filter.field !== "title" && filter.field !== "tag" && filter.field !== "docId") {
+    return null;
+  }
+  const allowedOperators =
+    filter.field === "docId"
+      ? ["equals", "in"]
+      : filter.field === "title"
+        ? ["contains", "equals", "startsWith"]
+        : ["contains", "equals"];
+  if (!allowedOperators.includes(filter.operator as string)) {
+    return null;
+  }
+
+  if (filter.operator === "in") {
+    if (!Array.isArray(filter.value)) {
+      return null;
+    }
+    const values = filter.value
+      .filter((entry): entry is string => typeof entry === "string")
+      .map(entry => entry.trim())
+      .filter(Boolean);
+    if (values.length === 0) {
+      return null;
+    }
+    return {
+      field: filter.field,
+      operator: "in",
+      value: Array.from(new Set(values)),
+    };
+  }
+
+  if (typeof filter.value !== "string") {
+    return null;
+  }
+  const valueText = filter.value.trim();
+  if (!valueText) {
+    return null;
+  }
+  return {
+    field: filter.field,
+    operator: filter.operator as CollectionRuleOperator,
+    value: valueText,
+  };
+}
+
+function normalizeCollectionRules(value: unknown): CollectionInfo["rules"] {
+  const rules = asRecord(value);
+  if (!rules) {
+    return { match: "all", filters: [] };
+  }
+
+  const match = rules.match === "any" ? "any" : "all";
+  const filters = Array.isArray(rules.filters)
+    ? rules.filters
+        .map(normalizeCollectionRuleFilter)
+        .filter((entry): entry is CollectionRuleFilter => entry !== null)
+    : [];
+
+  return { match, filters };
+}
+
+function matchesCollectionRule(doc: WorkspaceDocSummary, filter: CollectionRuleFilter): boolean {
+  const title = (doc.title ?? "").trim();
+  const lowerTitle = title.toLocaleLowerCase();
+  const tagValues = doc.tags.map(tag => tag.toLocaleLowerCase());
+
+  switch (filter.field) {
+    case "title": {
+      const target = filter.value.toString().toLocaleLowerCase();
+      if (filter.operator === "contains") {
+        return lowerTitle.includes(target);
+      }
+      if (filter.operator === "startsWith") {
+        return lowerTitle.startsWith(target);
+      }
+      return lowerTitle === target;
+    }
+    case "tag": {
+      const target = filter.value.toString().toLocaleLowerCase();
+      if (filter.operator === "contains") {
+        return tagValues.some(tag => tag.includes(target));
+      }
+      return tagValues.some(tag => tag === target);
+    }
+    case "docId": {
+      if (filter.operator === "in") {
+        return Array.isArray(filter.value)
+          ? filter.value.some(value => value === doc.id)
+          : false;
+      }
+      return doc.id === filter.value;
+    }
+  }
+}
+
+function matchesCollectionRules(doc: WorkspaceDocSummary, rules: CollectionInfo["rules"]): boolean {
+  if (rules.filters.length === 0) {
+    return false;
+  }
+
+  const matches = rules.filters.map(filter => matchesCollectionRule(doc, filter));
+  return rules.match === "any" ? matches.some(Boolean) : matches.every(Boolean);
+}
+
+function sortOrganizeNodes(nodes: OrganizeNodeRecord[]): OrganizeNodeRecord[] {
+  return [...nodes].sort((left, right) => {
+    const parentCompare = (left.parentId ?? "").localeCompare(right.parentId ?? "");
+    if (parentCompare !== 0) {
+      return parentCompare;
+    }
+    const indexCompare = left.index.localeCompare(right.index);
+    if (indexCompare !== 0) {
+      return indexCompare;
+    }
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function ensureFolderParent(
+  nodes: Map<string, OrganizeNodeRecord>,
+  parentId: string | null
+): void {
+  if (parentId === null) {
+    return;
+  }
+  const parent = nodes.get(parentId);
+  if (!parent || parent.type !== "folder") {
+    throw new Error(`Parent folder '${parentId}' was not found.`);
+  }
+}
+
+function ensureNodeIsFolder(nodes: Map<string, OrganizeNodeRecord>, nodeId: string): OrganizeNodeRecord {
+  const node = nodes.get(nodeId);
+  if (!node || node.type !== "folder") {
+    throw new Error(`Folder '${nodeId}' was not found.`);
+  }
+  return node;
+}
+
+function isAncestor(
+  nodes: Map<string, OrganizeNodeRecord>,
+  childId: string,
+  ancestorId: string
+): boolean {
+  if (childId === ancestorId) {
+    return false;
+  }
+  const seen = new Set<string>([childId]);
+  let current = childId;
+  while (true) {
+    const node = nodes.get(current);
+    if (!node?.parentId) {
+      return false;
+    }
+    current = node.parentId;
+    if (seen.has(current)) {
+      return false;
+    }
+    seen.add(current);
+    if (current === ancestorId) {
+      return true;
+    }
+  }
+}
+
+function nextOrganizeIndex(
+  nodes: OrganizeNodeRecord[],
+  parentId: string | null
+): string {
+  const siblings = nodes
+    .filter(node => node.parentId === parentId)
+    .sort((left, right) => left.index.localeCompare(right.index));
+  const last = siblings.at(-1);
+  return generateFractionalIndexingKeyBetween(last?.index ?? null, null);
+}
+
+type OrganizeLinkType = "doc" | "tag" | "collection";
+
+type OrganizeLinkResult = {
+  id: string;
+  parentId: string;
+  type: OrganizeLinkType;
+  data: string;
+  index: string;
+  storageDocId: string;
+};
+
+async function loadFoldersDoc(socket: any, workspaceId: string) {
+  const docId = specialWorkspaceDbDocId(workspaceId, "folders");
+  const snapshot = await loadDoc(socket, workspaceId, docId);
+  const doc = new Y.Doc();
+  if (snapshot.missing) {
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+  }
+  return { docId, doc, snapshot };
+}
+
+async function saveFoldersDoc(socket: any, workspaceId: string, docId: string, doc: Y.Doc) {
+  const update = Y.encodeStateAsUpdate(doc);
+  await pushDocUpdate(socket, workspaceId, docId, Buffer.from(update).toString("base64"));
+}
+
+export async function addOrganizeLinkToFolder(
+  socket: any,
+  workspaceId: string,
+  {
+    folderId,
+    type,
+    targetId,
+    index,
+  }: {
+    folderId: string;
+    type: OrganizeLinkType;
+    targetId: string;
+    index?: string;
+  }
+): Promise<OrganizeLinkResult> {
+  const { docId, doc } = await loadFoldersDoc(socket, workspaceId);
+  const nodes = readOrganizeNodes(doc);
+  const nodeMap = organizeNodeMap(nodes);
+  ensureNodeIsFolder(nodeMap, folderId);
+  const linkId = generateId();
+  const nextIndex = index ?? nextOrganizeIndex(nodes, folderId);
+  const record = ensureRecord(doc, linkId);
+  record.set("id", linkId);
+  record.set("type", type);
+  record.set("data", targetId);
+  record.set("parentId", folderId);
+  record.set("index", nextIndex);
+  record.delete("$$DELETED");
+  await saveFoldersDoc(socket, workspaceId, docId, doc);
+  return {
+    id: linkId,
+    parentId: folderId,
+    type,
+    data: targetId,
+    index: nextIndex,
+    storageDocId: docId,
+  };
+}
+
+export function registerOrganizeTools(
+  server: McpServer,
+  gql: GraphQLClient,
+  defaults: { workspaceId?: string }
+) {
+  async function getSocketContext() {
+    const { endpoint, cookie, bearer } = await gql.getConnectionAuth();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    return { socket };
+  }
+
+  async function loadWorkspaceRootDoc(socket: any, workspaceId: string) {
+    const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+    const doc = new Y.Doc();
+    if (snapshot.missing) {
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+    }
+    return { doc, snapshot };
+  }
+
+  async function saveWorkspaceRootDoc(socket: any, workspaceId: string, doc: Y.Doc) {
+    const update = Y.encodeStateAsUpdate(doc);
+    await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(update).toString("base64"));
+  }
+
+  async function mutateCollectionEntry({
+    workspaceId,
+    collectionId,
+    update,
+  }: {
+    workspaceId: string;
+    collectionId: string;
+    update: (context: {
+      socket: any;
+      doc: Y.Doc;
+      collection: CollectionInfo;
+    }) => CollectionMutationPatch | Promise<CollectionMutationPatch>;
+  }): Promise<CollectionInfo> {
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { doc } = await loadWorkspaceRootDoc(socket, workspaceId);
+      const setting = doc.getMap("setting");
+      const current = setting.get("collections");
+      if (!(current instanceof Y.Array)) {
+        throw new Error("Workspace does not contain any collections.");
+      }
+      const found = findCollection(current, collectionId);
+      if (!found) {
+        throw new Error(`Collection '${collectionId}' was not found.`);
+      }
+
+      const patch = await update({
+        socket,
+        doc,
+        collection: found.collection,
+      });
+      const next: CollectionInfo = { ...found.collection, ...patch };
+      const nextValue = { ...found.raw, ...patch };
+
+      doc.transact(() => {
+        current.delete(found.index, 1);
+        current.insert(found.index, [nextValue]);
+      });
+      await saveWorkspaceRootDoc(socket, workspaceId, doc);
+      return next;
+    } finally {
+      socket.disconnect();
+    }
+  }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function listWorkspaceDocsForCollectionRules(
+  socket: any,
+  workspaceId: string,
+  rootDoc?: Y.Doc,
+): Promise<WorkspaceDocSummary[]> {
+  const doc = rootDoc ?? (await loadWorkspaceRootDoc(socket, workspaceId)).doc;
+  const meta = doc.getMap("meta");
+  const tagOptionById = getWorkspaceTagOptionMaps(meta).byId;
+  const pageEntries = getWorkspacePageEntries(meta, tagOptionById);
+    const docs: WorkspaceDocSummary[] = [];
+
+    for (const entry of pageEntries) {
+      let mergedTitle = entry.title;
+      let mergedTags = entry.tags;
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const snapshot = await loadDoc(socket, workspaceId, entry.id);
+      if (snapshot.missing) {
+        const pageDoc = new Y.Doc();
+        Y.applyUpdate(pageDoc, Buffer.from(snapshot.missing, "base64"));
+        const pageMeta = pageDoc.share.get("meta");
+        if (pageMeta instanceof Y.Map) {
+          const docTitle = pageMeta.get("title");
+          if (entry.title === null && typeof docTitle === "string" && docTitle.trim().length > 0) {
+            mergedTitle = docTitle;
+          }
+        }
+      }
+
+      if (mergedTitle || mergedTags.length > 0 || attempt === 4) {
+        break;
+      }
+      await sleep(150);
+    }
+
+    docs.push({
+      id: entry.id,
+        title: mergedTitle,
+        tags: mergedTags,
+        createDate: entry.createDate,
+        updatedDate: entry.updatedDate,
+      });
+    }
+
+    return docs;
+  }
+
+  async function createFolderInternal({
+    workspaceId,
+    name,
+    parentId,
+    index,
+  }: {
+    workspaceId: string;
+    name: string;
+    parentId?: string | null;
+    index?: string;
+  }) {
+    const resolvedParentId = parentId ?? null;
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, workspaceId);
+      const nodes = readOrganizeNodes(doc);
+      const nodeMap = organizeNodeMap(nodes);
+      ensureFolderParent(nodeMap, resolvedParentId);
+      const folderId = generateId();
+      const folderIndex = index ?? nextOrganizeIndex(nodes, resolvedParentId);
+      const record = ensureRecord(doc, folderId);
+      record.set("id", folderId);
+      record.set("type", "folder");
+      record.set("data", name);
+      record.set("parentId", resolvedParentId);
+      record.set("index", folderIndex);
+      record.delete("$$DELETED");
+      await saveFoldersDoc(socket, workspaceId, docId, doc);
+      return {
+        id: folderId,
+        parentId: resolvedParentId,
+        type: "folder" as const,
+        data: name,
+        index: folderIndex,
+        storageDocId: docId,
+      };
+    } finally {
+      socket.disconnect();
+    }
+  }
+
+  async function updateCollectionRulesInternal({
+    workspaceId,
+    collectionId,
+    rules,
+  }: {
+    workspaceId: string;
+    collectionId: string;
+    rules: CollectionInfo["rules"];
+  }) {
+    const collection = await mutateCollectionEntry({
+      workspaceId,
+      collectionId,
+      update: async ({ socket, doc }) => {
+        const docs = await listWorkspaceDocsForCollectionRules(socket, workspaceId, doc);
+        const allowList = docs.filter(entry => matchesCollectionRules(entry, rules)).map(entry => entry.id);
+        return { rules, allowList };
+      },
+    });
+    return {
+      collection,
+      matchedDocIds: collection.allowList,
+      matchedCount: collection.allowList.length,
+    };
+  }
+
+  function requireWorkspaceId(workspaceId?: string): string {
+    const resolved = workspaceId || defaults.workspaceId;
+    if (!resolved) {
+      throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+    }
+    return resolved;
+  }
+
+  const listCollectionsHandler = async ({ workspaceId }: { workspaceId?: string }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { doc } = await loadWorkspaceRootDoc(socket, resolvedWorkspaceId);
+      const setting = doc.getMap("setting");
+      const current = setting.get("collections");
+      const collections = current instanceof Y.Array ? readCollections(current) : [];
+      return text([...collections].sort((left, right) => left.name.localeCompare(right.name)));
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "list_collections",
+    {
+      title: "List Collections",
+      description: "List AFFiNE sidebar collections and their rules. Use this read-only tool before updating, deleting, or adding documents to a collection.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+      },
+    },
+    listCollectionsHandler as any
+  );
+
+  const getCollectionHandler = async ({ workspaceId, collectionId }: { workspaceId?: string; collectionId: string }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { doc } = await loadWorkspaceRootDoc(socket, resolvedWorkspaceId);
+      const setting = doc.getMap("setting");
+      const current = setting.get("collections");
+      const collection = current instanceof Y.Array
+        ? findCollection(current, collectionId)?.collection
+        : undefined;
+      if (!collection) {
+        throw new Error(`Collection '${collectionId}' was not found.`);
+      }
+      return text(collection);
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "get_collection",
+    {
+      title: "Get Collection",
+      description: "Read one AFFiNE sidebar collection by id, including rules and allow-list. Use list_collections first when the id is unknown.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+      },
+    },
+    getCollectionHandler as any
+  );
+
+  const createCollectionHandler = async ({
+    workspaceId,
+    name,
+    rules,
+  }: {
+    workspaceId?: string;
+    name: string;
+    rules?: CollectionRulesInput;
+  }) => {
+    const parsedRules = rules === undefined ? undefined : CollectionRulesSchema.parse(rules);
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { doc } = await loadWorkspaceRootDoc(socket, resolvedWorkspaceId);
+      const setting = doc.getMap("setting");
+      let current = setting.get("collections") as Y.Array<any> | undefined;
+      if (!(current instanceof Y.Array)) {
+        current = new Y.Array<any>();
+        setting.set("collections", current);
+      }
+
+      const collection: CollectionInfo = {
+        id: generateId(),
+        name,
+        rules: parsedRules ? normalizeCollectionRules(parsedRules) : { match: "all", filters: [] },
+        allowList: [],
+      };
+
+      current.push([collection]);
+      await saveWorkspaceRootDoc(socket, resolvedWorkspaceId, doc);
+      return text(collection);
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "create_collection",
+    {
+      title: "Create Collection",
+      description: "Create a new AFFiNE sidebar collection with optional rules. This writes workspace sidebar metadata but does not create documents.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        name: FolderName.describe("Collection name"),
+        rules: CollectionRulesSchema.optional().describe("Optional rule set to initialize the collection with."),
+      },
+    },
+    createCollectionHandler as any
+  );
+
+  const updateCollectionRulesHandler = async ({
+    workspaceId,
+    collectionId,
+    rules,
+  }: {
+    workspaceId?: string;
+    collectionId: string;
+    rules: CollectionRulesInput;
+  }) => {
+    const parsedRules = CollectionRulesSchema.parse(rules);
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const normalizedRules = normalizeCollectionRules(parsedRules);
+    const result = await updateCollectionRulesInternal({
+      workspaceId: resolvedWorkspaceId,
+      collectionId,
+      rules: normalizedRules,
+    });
+    return text({
+      workspaceId: resolvedWorkspaceId,
+      collectionId,
+      rules: normalizedRules,
+      allowList: result.collection.allowList,
+      matchedDocIds: result.matchedDocIds,
+      matchedCount: result.matchedCount,
+    });
+  };
+
+  server.registerTool(
+    "update_collection_rules",
+    {
+      title: "Update Collection Rules",
+      description: "Replace an AFFiNE collection's rules and rebuild its allow-list from current workspace documents. This can change which docs appear in the collection.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+        rules: CollectionRulesSchema.describe("Rule set used to rebuild the collection allow-list."),
+      },
+    },
+    updateCollectionRulesHandler as any
+  );
+
+  const updateCollectionHandler = async ({
+    workspaceId,
+    collectionId,
+    name,
+  }: {
+    workspaceId?: string;
+    collectionId: string;
+    name?: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const collection = await mutateCollectionEntry({
+      workspaceId: resolvedWorkspaceId,
+      collectionId,
+      update: ({ collection: previous }) => ({
+        name: name ?? previous.name,
+      }),
+    });
+    return text(collection);
+  };
+
+  server.registerTool(
+    "update_collection",
+    {
+      title: "Update Collection",
+      description: "Rename an existing AFFiNE sidebar collection without changing its rules or allow-list.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+        name: FolderName.optional().describe("Updated collection name"),
+      },
+    },
+    updateCollectionHandler as any
+  );
+
+  const deleteCollectionHandler = async ({
+    workspaceId,
+    collectionId,
+  }: {
+    workspaceId?: string;
+    collectionId: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { doc } = await loadWorkspaceRootDoc(socket, resolvedWorkspaceId);
+      const setting = doc.getMap("setting");
+      const current = setting.get("collections");
+      if (!(current instanceof Y.Array)) {
+        throw new Error("Workspace does not contain any collections.");
+      }
+      const found = findCollection(current, collectionId);
+      if (!found) {
+        throw new Error(`Collection '${collectionId}' was not found.`);
+      }
+      current.delete(found.index, 1);
+      await saveWorkspaceRootDoc(socket, resolvedWorkspaceId, doc);
+      return text({ success: true, collectionId });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "delete_collection",
+    {
+      title: "Delete Collection",
+      description: "Delete an AFFiNE sidebar collection. This removes the collection metadata but does not delete the documents it referenced.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+      },
+    },
+    deleteCollectionHandler as any
+  );
+
+  const addDocToCollectionHandler = async ({
+    workspaceId,
+    collectionId,
+    docId,
+  }: {
+    workspaceId?: string;
+    collectionId: string;
+    docId: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const collection = await mutateCollectionEntry({
+      workspaceId: resolvedWorkspaceId,
+      collectionId,
+      update: ({ collection: previous }) => ({
+        allowList: Array.from(new Set([...previous.allowList, docId])),
+      }),
+    });
+    return text(collection);
+  };
+
+  server.registerTool(
+    "add_doc_to_collection",
+    {
+      title: "Add Doc To Collection",
+      description: "Add an existing document id to an AFFiNE collection allow-list. Use update_collection_rules instead when membership should be rule-driven.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+        docId: DocId,
+      },
+    },
+    addDocToCollectionHandler as any
+  );
+
+  const removeDocFromCollectionHandler = async ({
+    workspaceId,
+    collectionId,
+    docId,
+  }: {
+    workspaceId?: string;
+    collectionId: string;
+    docId: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const collection = await mutateCollectionEntry({
+      workspaceId: resolvedWorkspaceId,
+      collectionId,
+      update: ({ collection: previous }) => ({
+        allowList: previous.allowList.filter(id => id !== docId),
+      }),
+    });
+    return text(collection);
+  };
+
+  server.registerTool(
+    "remove_doc_from_collection",
+    {
+      title: "Remove Doc From Collection",
+      description: "Remove a document id from an AFFiNE collection allow-list. This does not delete the document or change collection rules.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        collectionId: CollectionId,
+        docId: DocId,
+      },
+    },
+    removeDocFromCollectionHandler as any
+  );
+
+  const listOrganizeNodesHandler = async ({ workspaceId }: { workspaceId?: string }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, resolvedWorkspaceId);
+      const nodes = sortOrganizeNodes(readOrganizeNodes(doc));
+      return text({
+        workspaceId: resolvedWorkspaceId,
+        storageDocId: docId,
+        nodes,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "list_organize_nodes",
+    {
+      title: "List Organize Nodes",
+      description: "Experimental: list AFFiNE sidebar organize folder and link nodes from the folders workspace DB. Use this before moving or deleting organize nodes.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+      },
+    },
+    listOrganizeNodesHandler as any
+  );
+
+  const createFolderHandler = async ({
+    workspaceId,
+    name,
+    parentId,
+    index,
+  }: {
+    workspaceId?: string;
+    name: string;
+    parentId?: string | null;
+    index?: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    return text(await createFolderInternal({
+      workspaceId: resolvedWorkspaceId,
+      name,
+      parentId,
+      index,
+    }));
+  };
+
+  server.registerTool(
+    "create_folder",
+    {
+      title: "Create Folder",
+      description: "Experimental: create an AFFiNE organize folder node in the sidebar tree. This only changes sidebar organization, not document content.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        name: FolderName.describe("Folder name"),
+        parentId: FolderId.nullable().optional().describe("Parent folder id. Omit for root-level folders."),
+        index: z.string().optional().describe("Optional fractional index. Defaults to append-after-last."),
+      },
+    },
+    createFolderHandler as any
+  );
+
+  const createWorkspaceBlueprintHandler = async ({
+    workspaceId,
+    rootFolderName,
+    childFolderNames,
+  }: {
+    workspaceId?: string;
+    rootFolderName: string;
+    childFolderNames?: string[];
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const normalizedChildFolderNames = Array.from(
+      new Set((childFolderNames ?? []).map(name => name.trim()).filter(Boolean))
+    );
+
+    const rootFolder = await createFolderInternal({
+      workspaceId: resolvedWorkspaceId,
+      name: rootFolderName,
+    });
+
+    const childFolders = [];
+    for (const childName of normalizedChildFolderNames) {
+      childFolders.push(await createFolderInternal({
+        workspaceId: resolvedWorkspaceId,
+        name: childName,
+        parentId: rootFolder.id,
+      }));
+    }
+
+    return text({
+      workspaceId: resolvedWorkspaceId,
+      rootFolderId: rootFolder.id,
+      rootFolderName,
+      childFolders,
+      childFolderCount: childFolders.length,
+      storageDocId: rootFolder.storageDocId,
+    });
+  };
+
+  server.registerTool(
+    "create_workspace_blueprint",
+    {
+      title: "Create Workspace Blueprint",
+      description: "Create a simple AFFiNE organize folder blueprint with one root folder and optional child folders. This is a convenience wrapper around create_folder.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        rootFolderName: FolderName.describe("Root folder name"),
+        childFolderNames: z.array(FolderName).optional().describe("Optional child folder names to seed under the root folder."),
+      },
+    },
+    createWorkspaceBlueprintHandler as any
+  );
+
+  const renameFolderHandler = async ({
+    workspaceId,
+    folderId,
+    name,
+  }: {
+    workspaceId?: string;
+    folderId: string;
+    name: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, resolvedWorkspaceId);
+      const nodeMap = organizeNodeMap(readOrganizeNodes(doc));
+      ensureNodeIsFolder(nodeMap, folderId);
+      const record = ensureRecord(doc, folderId);
+      record.set("data", name);
+      await saveFoldersDoc(socket, resolvedWorkspaceId, docId, doc);
+      return text({ id: folderId, name });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "rename_folder",
+    {
+      title: "Rename Folder",
+      description: "Experimental: rename an AFFiNE organize folder node. This changes sidebar metadata only and does not rename documents inside the folder.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        folderId: FolderId,
+        name: FolderName,
+      },
+    },
+    renameFolderHandler as any
+  );
+
+  const deleteFolderHandler = async ({
+    workspaceId,
+    folderId,
+  }: {
+    workspaceId?: string;
+    folderId: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, resolvedWorkspaceId);
+      const nodes = readOrganizeNodes(doc);
+      const nodeMap = organizeNodeMap(nodes);
+      ensureNodeIsFolder(nodeMap, folderId);
+
+      const stack = [folderId];
+      const deletedIds: string[] = [];
+      while (stack.length > 0) {
+        const currentId = stack.pop()!;
+        const current = nodeMap.get(currentId);
+        if (!current) {
+          continue;
+        }
+        if (current.type === "folder") {
+          const children = nodes.filter(node => node.parentId === current.id);
+          for (const child of children) {
+            stack.push(child.id);
+          }
+        }
+        deleteRecord(ensureRecord(doc, currentId));
+        deletedIds.push(currentId);
+      }
+
+      await saveFoldersDoc(socket, resolvedWorkspaceId, docId, doc);
+      return text({ success: true, deletedIds });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "delete_folder",
+    {
+      title: "Delete Folder",
+      description: "Experimental: delete an AFFiNE organize folder and every nested folder or link node. This is destructive for sidebar organization but does not delete target documents, tags, or collections.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        folderId: FolderId,
+      },
+    },
+    deleteFolderHandler as any
+  );
+
+  const moveOrganizeNodeHandler = async ({
+    workspaceId,
+    nodeId,
+    parentId,
+    index,
+  }: {
+    workspaceId?: string;
+    nodeId: string;
+    parentId?: string | null;
+    index?: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const resolvedParentId = parentId ?? null;
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, resolvedWorkspaceId);
+      const nodes = readOrganizeNodes(doc);
+      const nodeMap = organizeNodeMap(nodes);
+      const node = nodeMap.get(nodeId);
+      if (!node) {
+        throw new Error(`Organize node '${nodeId}' was not found.`);
+      }
+      ensureFolderParent(nodeMap, resolvedParentId);
+      if (resolvedParentId === null && node.type !== "folder") {
+        throw new Error("Root organize section can only contain folders.");
+      }
+      if (resolvedParentId && node.type === "folder" && isAncestor(nodeMap, resolvedParentId, nodeId)) {
+        throw new Error("Cannot move a folder into its descendant.");
+      }
+      const nextIndex = index ?? nextOrganizeIndex(nodes.filter(entry => entry.id !== nodeId), resolvedParentId);
+      const record = ensureRecord(doc, nodeId);
+      record.set("parentId", resolvedParentId);
+      record.set("index", nextIndex);
+      await saveFoldersDoc(socket, resolvedWorkspaceId, docId, doc);
+      return text({ id: nodeId, parentId: resolvedParentId, index: nextIndex });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "move_organize_node",
+    {
+      title: "Move Organize Node",
+      description: "Experimental: move an AFFiNE organize folder or link node to another folder or root. This preserves the target document, tag, or collection and changes only sidebar placement.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        nodeId: OrganizeNodeId,
+        parentId: FolderId.nullable().optional().describe("Destination folder id. Omit for root-level placement."),
+        index: z.string().optional().describe("Optional fractional index. Defaults to append-after-last."),
+      },
+    },
+    moveOrganizeNodeHandler as any
+  );
+
+  const addOrganizeLinkHandler = async ({
+    workspaceId,
+    folderId,
+    type,
+    targetId,
+    index,
+  }: {
+    workspaceId?: string;
+    folderId: string;
+    type: "doc" | "tag" | "collection";
+    targetId: string;
+    index?: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const link = await addOrganizeLinkToFolder(socket, resolvedWorkspaceId, {
+        folderId,
+        type,
+        targetId,
+        index,
+      });
+      return text(link);
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "add_organize_link",
+    {
+      title: "Add Organize Link",
+      description: "Experimental: add a doc, tag, or collection link under an AFFiNE organize folder. Use move_organize_node for an existing link node instead of creating a duplicate link.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        folderId: FolderId,
+        type: z.enum(["doc", "tag", "collection"]).describe("Type of target represented by the organize link."),
+        targetId: z.string().min(1).describe("Target doc/tag/collection id"),
+        index: z.string().optional().describe("Optional fractional index. Defaults to append-after-last."),
+      },
+    },
+    addOrganizeLinkHandler as any
+  );
+
+  const deleteOrganizeLinkHandler = async ({
+    workspaceId,
+    nodeId,
+  }: {
+    workspaceId?: string;
+    nodeId: string;
+  }) => {
+    const resolvedWorkspaceId = requireWorkspaceId(workspaceId);
+    const { socket } = await getSocketContext();
+    try {
+      await joinWorkspace(socket, resolvedWorkspaceId);
+      const { docId, doc } = await loadFoldersDoc(socket, resolvedWorkspaceId);
+      const nodeMap = organizeNodeMap(readOrganizeNodes(doc));
+      const node = nodeMap.get(nodeId);
+      if (!node || node.type === "folder") {
+        throw new Error(`Organize link '${nodeId}' was not found.`);
+      }
+      deleteRecord(ensureRecord(doc, nodeId));
+      await saveFoldersDoc(socket, resolvedWorkspaceId, docId, doc);
+      return text({ success: true, nodeId });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    "delete_organize_link",
+    {
+      title: "Delete Organize Link",
+      description: "Experimental: delete an AFFiNE organize doc, tag, or collection link node. This removes only the sidebar link, not the target resource.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        nodeId: OrganizeNodeId,
+      },
+    },
+    deleteOrganizeLinkHandler as any
+  );
+}

@@ -1,0 +1,289 @@
+# Getting Started
+
+This guide is the fastest way to get AFFiNE MCP Server working and confirm that your MCP client can reach AFFiNE successfully.
+
+## Choose a setup path
+
+| Scenario | Recommended path |
+| --- | --- |
+| Local MCP client on your machine | Use the saved-config flow with `affine-mcp login` |
+| AFFiNE Cloud | Use a signed-in browser session cookie |
+| Self-hosted AFFiNE | Use email/password or a signed-in session cookie |
+| Temporary usage without a global install | Use `npx` |
+| Run the server in Docker | Use the GHCR image and HTTP transport |
+| Remote MCP deployment | Skip to [configuration and deployment](configuration-and-deployment.md) |
+
+## Path A: Saved config with interactive login
+
+This is the recommended local setup because it keeps client config minimal and avoids repeated environment-variable configuration.
+
+### 1. Install the CLI
+
+```bash
+npm i -g affine-mcp-server
+affine-mcp --version
+```
+
+### 2. Save credentials
+
+```bash
+affine-mcp login
+```
+
+What happens:
+
+- The CLI asks for your AFFiNE base URL, defaulting to the existing environment
+  or saved URL when one is already configured
+- For AFFiNE Cloud, it guides you to paste the Cookie request header from a signed-in browser session
+- For self-hosted AFFiNE, it signs in with email/password and saves the resulting session cookie
+- Workspace discovery displays the workspace name first and falls back to
+  `Workspace name unavailable` when no name is available; the full workspace ID
+  remains visible
+- The effective config is stored at `$XDG_CONFIG_HOME/affine-mcp/config` when `XDG_CONFIG_HOME` is set, otherwise at `~/.config/affine-mcp/config`
+
+An invalid numeric selection is rejected and prompted again. Enter `q` or send
+end-of-file to cancel login without changing the saved config. If workspace
+discovery fails, login reports the failure and does not claim completion or write
+a partial credential set.
+
+For automation, pass browser-session cookies through stdin instead of process arguments:
+
+```bash
+affine-mcp login --url https://app.affine.pro --cookie-stdin --workspace-id your-workspace-id --force
+```
+
+Paste the cookie at the hidden prompt, or pipe it from a trusted secret source. The requested workspace must be available to the authenticated account. Piped input requires `--force` when existing credentials would be replaced.
+
+Once credentials are saved, list and switch workspaces without another login:
+
+```bash
+affine-mcp workspaces
+affine-mcp workspaces --json
+affine-mcp workspace <workspace-id>
+```
+
+`workspaces` marks the saved default. `workspace` validates access using the
+current credentials and changes only `AFFINE_WORKSPACE_ID`; it is a local
+selection and does not expand the account's access boundary. With no ID,
+`workspace` prompts for the same validated selection.
+
+### 3. Verify the saved config
+
+```bash
+affine-mcp status
+affine-mcp doctor
+affine-mcp snippet codex
+```
+
+### 4. Register the server with a client
+
+Minimal stdio config:
+
+```json
+{
+  "mcpServers": {
+    "affine": {
+      "command": "affine-mcp"
+    }
+  }
+}
+```
+
+See [client setup](client-setup.md) for full client-specific snippets.
+
+The recommended Codex snippet is a command-only registration line that keeps
+using the current saved login. Claude and Cursor snippets are JSON. After
+applying a snippet, restart or reconnect the client so it launches a fresh MCP
+process.
+
+For an explicit environment snapshot, add `--env` to a snippet command. It
+copies the currently resolved credentials, headers, URL, workspace, and relevant
+OAuth settings; client environment variables take precedence over saved config,
+so remove or regenerate copied credentials when they need renewal.
+
+## Path B: Explicit environment variables
+
+Use this path when you prefer stateless or container-friendly setup instead of a saved config file.
+
+### Required variables
+
+- `AFFINE_BASE_URL`
+- One auth strategy:
+  - `AFFINE_COOKIE`
+  - `AFFINE_EMAIL` and `AFFINE_PASSWORD`
+  - `AFFINE_API_TOKEN` only when the target deployment still accepts a compatible GraphQL bearer token
+
+### Example: AFFiNE Cloud
+
+```bash
+export AFFINE_BASE_URL="https://app.affine.pro"
+export AFFINE_COOKIE="your-complete-cookie-request-header"
+affine-mcp status
+```
+
+### Example: self-hosted AFFiNE with email/password
+
+```bash
+export AFFINE_BASE_URL="https://your-affine.example.com"
+export AFFINE_EMAIL="you@example.com"
+export AFFINE_PASSWORD="secret"
+affine-mcp status
+```
+
+For the full environment-variable reference, see [configuration and deployment](configuration-and-deployment.md#environment-variables).
+
+## Path C: Run from the Docker image
+
+Use this when:
+
+- you want a containerized local or remote deployment
+- you prefer an HTTP MCP endpoint over stdio
+- you do not want to install Node.js on the target host
+
+```bash
+docker run -d \
+  -p 3000:3000 \
+  -e MCP_TRANSPORT=http \
+  -e AFFINE_BASE_URL=https://your-affine-instance.com \
+  -e AFFINE_EMAIL=you@example.com \
+  -e AFFINE_PASSWORD=your-password \
+  -e AFFINE_MCP_AUTH_MODE=bearer \
+  -e AFFINE_MCP_HTTP_TOKEN=your-strong-secret \
+  ghcr.io/dawncr0w/affine-mcp-server:latest
+```
+
+Quick verification:
+
+```bash
+curl http://localhost:3000/healthz
+curl http://localhost:3000/readyz
+```
+
+Client-side MCP config:
+
+```json
+{
+  "mcpServers": {
+    "affine": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer your-strong-secret"
+      }
+    }
+  }
+}
+```
+
+Remote bearer-mode listeners fail to start without
+`AFFINE_MCP_HTTP_TOKEN`. Send this token only in the `Authorization` header;
+query-string tokens are rejected by default.
+
+For OAuth mode, origin controls, and deployment hardening, continue with [configuration and deployment](configuration-and-deployment.md#docker).
+
+## Path D: Run from a local clone
+
+Use this when you want to inspect or modify the server locally.
+
+```bash
+git clone https://github.com/dawncr0w/affine-mcp-server.git
+cd affine-mcp-server
+npm install
+npm run build
+node dist/index.js
+```
+
+You can also expose a linked CLI locally:
+
+```bash
+npm link
+affine-mcp --version
+```
+
+## Verify your setup
+
+Use this sequence after any first-run setup:
+
+```bash
+affine-mcp login
+affine-mcp doctor
+affine-mcp snippet codex
+```
+
+For an already configured installation, `login` can be replaced with
+`affine-mcp status`. Apply the generated client configuration, then restart or
+reconnect that client.
+
+If you are running the Docker image, also verify:
+
+```bash
+curl http://localhost:3000/healthz
+curl http://localhost:3000/readyz
+```
+
+Expected results:
+
+- `status` confirms the active base URL, auth source, and connection result
+- `show-config` prints the effective configuration with secrets redacted
+- `doctor` checks the resolved base URL, authentication, GraphQL access, selected
+  workspace membership, realtime workspace-root access, effective tool filters,
+  HTTP exposure when HTTP mode is selected, and OAuth configuration/discovery
+  when OAuth is selected. It does not validate every environment-only proxy,
+  WebSocket, or HTTP runtime limit; those are checked when their runtime starts.
+- `healthz` reports process liveness; `readyz` succeeds only when OAuth discovery (if enabled) and the configured AFFiNE GraphQL endpoint are reachable
+
+OAuth metadata requests have a five-second timeout covering headers and the complete response body. Failed discovery entries are removed from the cache so the next readiness check or token verification can retry after the issuer recovers.
+
+### Advanced: explicit environment snapshot
+
+If you are onboarding another client and need an explicit environment snapshot,
+these helpers copy the current config into the generated snippets:
+
+```bash
+affine-mcp snippet claude --env
+affine-mcp snippet codex --env
+affine-mcp snippet all --env
+```
+
+Use `command -v affine-mcp` and `command -v node` when a GUI client cannot find
+the executable. See [GUI client PATH troubleshooting](client-setup.md#gui-client-path-troubleshooting)
+for absolute-path examples and the Node.js shebang requirement.
+
+## Common first-run failures
+
+### Cloudflare blocks email/password sign-in
+
+AFFiNE Cloud (`app.affine.pro`) is behind Cloudflare. Programmatic requests to `/api/auth/sign-in` are blocked.
+
+Use `AFFINE_COOKIE`, or run `affine-mcp login` and paste the Cookie request header from a signed-in browser session.
+
+### Saved config exists, but the client cannot connect
+
+Run:
+
+```bash
+affine-mcp status
+affine-mcp doctor
+```
+
+Then verify that the client is invoking `affine-mcp` from the same environment where the config file exists.
+
+### Workspace is missing
+
+This server can access only server-backed AFFiNE workspaces.
+
+It cannot access workspaces that exist only in browser local storage.
+
+### "Method not found" when calling a tool
+
+MCP tools are not JSON-RPC top-level method names. Use an MCP client that calls `tools/list` and `tools/call` instead of sending direct JSON-RPC methods such as `{"method":"list_workspaces"}`.
+
+### Self-hosted email/password does not work
+
+Confirm:
+
+- your instance exposes the standard auth endpoints
+- Cloudflare or another bot-protection layer is not blocking sign-in
+- the credentials are valid
+
+If in doubt, re-run `affine-mcp login` or use a fresh signed-in session cookie.

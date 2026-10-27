@@ -88,6 +88,7 @@
     "test:http-security": "tsx tests/test-http-security.mjs",
     "test:http-runtime": "tsx tests/test-http-runtime-safety.mjs",
     "test:tenant": "tsx tests/test-tenant.mjs",
+    "test:docs-routes": "tsx tests/test-docs-routes.mjs",
     "test:openapi": "node tests/test-openapi.mjs",
     "docs:openapi": "node scripts/generate-openapi.mjs",
     "test:oauth-http": "node tests/test-oauth-http.mjs",

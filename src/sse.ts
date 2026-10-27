@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerConfig } from "./config.js";
 import { registerHttpDiagnosticsRoutes } from "./httpDiagnostics.js";
 import { TenantError } from "./tenant.js";
+import { registerHttpDocsRoutes } from "./httpDocs.js";
 import { createHttpAuthState, registerHttpAuthRoutes } from "./httpAuth.js";
 import {
   isLoopbackHostname,
@@ -242,6 +243,7 @@ export async function startHttpMcpServer(
   const { authMiddleware } = authState;
   registerHttpAuthRoutes(app, authState, corsMiddleware);
   registerHttpDiagnosticsRoutes(app, config, authState, corsMiddleware);
+  registerHttpDocsRoutes(app, config);
 
   // Explicit preflight handlers for the legacy SSE routes.
   app.options("/sse", corsMiddleware);

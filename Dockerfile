@@ -31,6 +31,7 @@ COPY --from=builder --chown=affine:affine /app/dist ./dist
 COPY --chown=affine:affine bin/ ./bin/
 COPY --chown=affine:affine package.json ./
 COPY --chown=affine:affine tool-manifest.json ./
+COPY --chown=affine:affine docs/index.html docs/openapi.json ./docs/
 
 USER affine
 

@@ -282,6 +282,9 @@ their input and output schemas. It is machine-readable, so it also works as cont
 npx serve docs
 ```
 
+When the HTTP server is running, the reference is served at `/docs` and the spec at `/openapi.json`
+(set `AFFINE_MCP_DOCS=false` to disable; `AFFINE_MCP_PUBLIC_BASE_URL` sets the server URL shown in it).
+
 The spec is generated from the running server, so it cannot drift from the code:
 
 ```bash

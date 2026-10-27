@@ -147,6 +147,7 @@ the transport, HTTP bind/auth/origin values, and all OAuth settings shown here.
 | `AFFINE_OAUTH_SCOPES` | No | `mcp` | Scopes advertised for OAuth-protected access |
 | `AFFINE_OAUTH_CLOCK_SKEW_SECONDS` | No | `60` | Positive integer tolerance for OAuth token timestamps |
 | `AFFINE_OAUTH_ALLOW_SERVICE_WRITES` | No | `false` | Explicitly acknowledge write-capable tools using the shared AFFiNE service identity |
+| `AFFINE_MCP_DOCS` | No | `true` | Serve the Scalar API reference at `/docs` and the OpenAPI spec at `/openapi.json`. Public and secret-free; set `false` to disable |
 | `AFFINE_MCP_MULTI_TENANT` | No | `false` | Serve many AFFiNE users and domains from one deployment; each MCP session supplies its own AFFiNE URL and credentials. Requires HTTP transport, `AFFINE_MCP_HTTP_TOKEN`, and `AFFINE_MCP_TENANT_ALLOWED_HOSTS` |
 | `AFFINE_MCP_TENANT_ALLOWED_HOSTS` | Required in multi-tenant mode | none | Comma-separated AFFiNE hostnames a session may target: exact (`affine.example.com`) or `*.team.example.com` (subdomains only). A bare `*` is rejected |
 

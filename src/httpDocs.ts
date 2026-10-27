@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import type express from "express";
 import type { Request, Response } from "express";
 
-import type { ServerConfig } from "./config.js";
 import { parseBooleanFlag } from "./networkSecurity.js";
 
 const DOCS_DIR = new URL("../docs/", import.meta.url);
@@ -14,7 +13,7 @@ type DocAsset = { body: string; contentType: string };
  * Both describe the tool surface and contain no secrets, so they are public.
  * Set `AFFINE_MCP_DOCS=false` to turn them off.
  */
-export function registerHttpDocsRoutes(app: express.Express, config: ServerConfig): void {
+export function registerHttpDocsRoutes(app: express.Express): void {
   const raw = process.env.AFFINE_MCP_DOCS;
   const enabled = raw === undefined || raw.trim() === "" ? true : parseBooleanFlag("AFFINE_MCP_DOCS", raw);
   if (!enabled) return;
@@ -32,10 +31,9 @@ export function registerHttpDocsRoutes(app: express.Express, config: ServerConfi
     let asset: DocAsset;
     if (file === "openapi.json") {
       const spec = JSON.parse(text);
-      // Point "Try it" and snippets at this deployment when its public URL is configured.
-      if (config.publicBaseUrl && spec.servers?.[0]?.variables?.baseUrl) {
-        spec.servers[0].variables.baseUrl.default = config.publicBaseUrl;
-      }
+      // Relative server URL: "Try it" and snippets target whichever origin serves this page,
+      // so requests are same-origin (no CORS) and never fall back to a stale localhost default.
+      spec.servers = [{ url: "/", description: "This deployment" }];
       asset = { body: JSON.stringify(spec), contentType: "application/json; charset=utf-8" };
     } else {
       asset = { body: text, contentType: "text/html; charset=utf-8" };

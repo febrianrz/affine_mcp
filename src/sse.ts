@@ -243,7 +243,7 @@ export async function startHttpMcpServer(
   const { authMiddleware } = authState;
   registerHttpAuthRoutes(app, authState, corsMiddleware);
   registerHttpDiagnosticsRoutes(app, config, authState, corsMiddleware);
-  registerHttpDocsRoutes(app, config);
+  registerHttpDocsRoutes(app);
 
   // Explicit preflight handlers for the legacy SSE routes.
   app.options("/sse", corsMiddleware);

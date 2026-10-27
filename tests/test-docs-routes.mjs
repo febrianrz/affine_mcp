@@ -16,7 +16,6 @@ const config = {
   http: { host: "127.0.0.1", port: 0, allowedOrigins: [], allowAllOrigins: false },
   oauthAllowServiceWrites: false,
   multiTenant: false,
-  publicBaseUrl: "https://mcp.example.com",
 };
 const create = async () => new McpServer({ name: "docs-test", version: "1.0.0" });
 
@@ -46,7 +45,7 @@ await withServer(undefined, async (base) => {
     assert.equal(response.status, 200, route);
     const spec = await response.json();
     assert.match(spec.openapi, /^3\.1/);
-    assert.equal(spec.servers[0].variables.baseUrl.default, "https://mcp.example.com", "public URL is applied");
+    assert.deepEqual(spec.servers.map((server) => server.url), ["/"], "served spec targets its own origin");
   }
 });
 

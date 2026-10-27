@@ -283,7 +283,7 @@ npx serve docs
 ```
 
 When the HTTP server is running, the reference is served at `/docs` and the spec at `/openapi.json`
-(set `AFFINE_MCP_DOCS=false` to disable; `AFFINE_MCP_PUBLIC_BASE_URL` sets the server URL shown in it).
+(set `AFFINE_MCP_DOCS=false` to disable). The served spec targets its own origin, so "Try it" works without CORS setup.
 
 The spec is generated from the running server, so it cannot drift from the code:
 

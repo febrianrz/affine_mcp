@@ -1,0 +1,32 @@
+# Satu container MCP per akun AFFiNE. Tiap akun punya file .env sendiri
+# (.env.kerja, .env.pribadi, ...) yang di-gitignore. Salin dari account.env.example.
+#
+#   cd deploy/multi-account
+#   cp account.env.example .env.kerja && cp account.env.example .env.pribadi
+#   # isi masing-masing, lalu:
+#   docker compose up -d --build
+#
+# Port hanya di-bind ke 127.0.0.1. Untuk akses remote, taruh reverse proxy HTTPS di depannya.
+
+x-affine: &affine
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: [/tmp]
+
+services:
+  affine-kerja:
+    <<: *affine
+    env_file: .env.kerja
+    ports: ["127.0.0.1:3001:3000"]
+
+  affine-pribadi:
+    <<: *affine
+    env_file: .env.pribadi
+    ports: ["127.0.0.1:3002:3000"]
+
+  # Akun tambahan: salin blok di atas, ganti nama service, env_file, dan port host.
